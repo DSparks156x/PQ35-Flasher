@@ -63,10 +63,10 @@ On this Windows host, use the project interpreter for J2534:
 
 ```powershell
 $python = 'C:\Users\raccoon\AppData\Local\Programs\Python\Python311-32\python.exe'
-& $python flasher/runner.py --help
-& $python flasher/runner.py --module awd --adapter j2534 --readout --dry-run
-& $python flasher/runner.py --module 0x0A --adapter j2534 --readout --start 0x30000 --end 0x3ffff --out data/raw/readout/calibration_original
-& $python flasher/runner.py --module awd --adapter j2534 --input artifacts/candidate_320k.bin --start 0x18000 --end 0x4ffff --dry-run
+& $python -m flasher.runner --help
+& $python -m flasher.runner --module awd --adapter j2534 --readout --dry-run
+& $python -m flasher.runner --module 0x0A --adapter j2534 --readout --start 0x30000 --end 0x3ffff --out data/raw/readout/calibration_original
+& $python -m flasher.runner --module awd --adapter j2534 --input artifacts/candidate_320k.bin --start 0x18000 --end 0x4ffff --dry-run
 ```
 
 `--dry-run` does not load a hardware driver, access CAN, or relaunch Python.
@@ -106,8 +106,8 @@ file must not already exist. `--eps-sa-add` can override the read-level
 additive constant if its exact slot value is established for another rack.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eeprom --out data/raw/eps/tt3001_eeprom_1k.bin --dry-run
-& $python flasher/runner.py --module eps --read-eeprom --out data/raw/eps/tt3001_eeprom_1k.bin
+& $python -m flasher.runner --module eps --read-eeprom --out data/raw/eps/tt3001_eeprom_1k.bin --dry-run
+& $python -m flasher.runner --module eps --read-eeprom --out data/raw/eps/tt3001_eeprom_1k.bin
 & $python tools/decode_eps_eeprom_record.py data/raw/eps/tt3001_eeprom_1k.bin
 ```
 
@@ -124,8 +124,8 @@ Run it while stationary, before clearing the stored event; do not poll KWP
 pages routinely while driving.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eps-faults --out data/raw/eps/fault_pages.json --dry-run
-& $python flasher/runner.py --module eps --read-eps-faults --out data/raw/eps/fault_pages.json
+& $python -m flasher.runner --module eps --read-eps-faults --out data/raw/eps/fault_pages.json --dry-run
+& $python -m flasher.runner --module eps --read-eps-faults --out data/raw/eps/fault_pages.json
 & $python tools/decode_eps_kwp_fault_pages.py data/raw/eps/fault_pages.json
 ```
 
@@ -146,8 +146,8 @@ security access, clear faults, or write firmware. The field's predicted wire
 layout still needs a live response check; the raw response is retained.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eps-motion --motion-samples 20 --motion-interval-ms 100 --out data/raw/eps/stationary_motion.json --dry-run
-& $python flasher/runner.py --module eps --read-eps-motion --motion-samples 20 --motion-interval-ms 100 --out data/raw/eps/stationary_motion.json
+& $python -m flasher.runner --module eps --read-eps-motion --motion-samples 20 --motion-interval-ms 100 --out data/raw/eps/stationary_motion.json --dry-run
+& $python -m flasher.runner --module eps --read-eps-motion --motion-samples 20 --motion-interval-ms 100 --out data/raw/eps/stationary_motion.json
 ```
 
 To establish the rack's **actual** HCA calibration before comparing tests,
@@ -161,8 +161,8 @@ references, and reports the current `0x5D0A4/A6/A8` values and all three
 range is never treated as captured rack data.
 
 ```powershell
-& $python flasher/runner.py --module eps --readout --start 0x5D000 --end 0x5EFFF --out data/raw/eps/hca_sectors --dry-run
-& $python flasher/runner.py --module eps --readout --start 0x5D000 --end 0x5EFFF --out data/raw/eps/hca_sectors
+& $python -m flasher.runner --module eps --readout --start 0x5D000 --end 0x5EFFF --out data/raw/eps/hca_sectors --dry-run
+& $python -m flasher.runner --module eps --readout --start 0x5D000 --end 0x5EFFF --out data/raw/eps/hca_sectors
 & $python tools/identify_eps_hca_readout.py data/raw/eps/hca_sectors --out artifacts/eps_hca_sectors_identified.json
 ```
 
@@ -182,8 +182,8 @@ intervals of possible internal counts; its field layout still awaits a live
 response check.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eps-assist --assist-samples 20 --assist-interval-ms 100 --out data/raw/eps/stationary_assist.json --dry-run
-& $python flasher/runner.py --module eps --read-eps-assist --assist-samples 20 --assist-interval-ms 100 --out data/raw/eps/stationary_assist.json
+& $python -m flasher.runner --module eps --read-eps-assist --assist-samples 20 --assist-interval-ms 100 --out data/raw/eps/stationary_assist.json --dry-run
+& $python -m flasher.runner --module eps --read-eps-assist --assist-samples 20 --assist-interval-ms 100 --out data/raw/eps/stationary_assist.json
 node --jitless tools/decode_tt3001_group05.js data/raw/eps/stationary_assist.json
 ```
 
@@ -197,8 +197,8 @@ that path. This proxy is neither a calibrated voltage nor the held rate
 factor. Preserve the raw response if the layout differs.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eps-supply --supply-samples 20 --supply-interval-ms 100 --out data/raw/eps/stationary_supply.json --dry-run
-& $python flasher/runner.py --module eps --read-eps-supply --supply-samples 20 --supply-interval-ms 100 --out data/raw/eps/stationary_supply.json
+& $python -m flasher.runner --module eps --read-eps-supply --supply-samples 20 --supply-interval-ms 100 --out data/raw/eps/stationary_supply.json --dry-run
+& $python -m flasher.runner --module eps --read-eps-supply --supply-samples 20 --supply-interval-ms 100 --out data/raw/eps/stationary_supply.json
 node --jitless tools/decode_tt3001_group02_supply.js 61 02 06 7D 54
 ```
 
@@ -214,8 +214,8 @@ controller is ready, or any frame was transmitted. This command does not
 change the configuration. Do not routine-poll KWP while driving.
 
 ```powershell
-& $python flasher/runner.py --module eps --read-eps-can-config --out data/raw/eps/stationary_can_config.json --dry-run
-& $python flasher/runner.py --module eps --read-eps-can-config --out data/raw/eps/stationary_can_config.json
+& $python -m flasher.runner --module eps --read-eps-can-config --out data/raw/eps/stationary_can_config.json --dry-run
+& $python -m flasher.runner --module eps --read-eps-can-config --out data/raw/eps/stationary_can_config.json
 ```
 
 Always inspect the offline plan first.  A real run requires the EPS to be
@@ -223,10 +223,10 @@ reachable through the selected adapter (for example through the vehicle
 gateway at the OBD connector):
 
 ```powershell
-& $python flasher/runner.py --module eps --readout --dry-run
-& $python flasher/runner.py --module 0x09 --readout --out data/raw/readout/pq_eps_obd
-& $python flasher/runner.py --module eps --input artifacts/eps_3001_slew_test/TT_3001_239_hca_slew4.bin --start 0x5D000 --end 0x5DFFF --dry-run
-& $python flasher/runner.py --module eps --adapter j2534 --input artifacts/eps_3001_slew_test/TT_3001_239_hca_slew4.bin --start 0x5D000 --end 0x5DFFF
+& $python -m flasher.runner --module eps --readout --dry-run
+& $python -m flasher.runner --module 0x09 --readout --out data/raw/readout/pq_eps_obd
+& $python -m flasher.runner --module eps --input artifacts/eps_3001_slew_test/TT_3001_239_hca_slew4.bin --start 0x5D000 --end 0x5DFFF --dry-run
+& $python -m flasher.runner --module eps --adapter j2534 --input artifacts/eps_3001_slew_test/TT_3001_239_hca_slew4.bin --start 0x5D000 --end 0x5DFFF
 ```
 
 The output is a 393216-byte CPU-linear image padded with `0xff`.  `report.json`
