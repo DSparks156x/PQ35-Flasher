@@ -149,7 +149,8 @@ SIMULATOR_PATCHES = [
 
 
 def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: bool = False,
-                   start: int = 0x18000, end: int = 0x4ffff) -> dict:
+                   start: int = 0x18000, end: int = 0x4ffff,
+                   correct_checksums: bool = False) -> dict:
     """
     Applies the complete Anti-Brick Safety Suite (and optional Simulator Mode) to a 320 KB ST10 CPU firmware image:
     1. Installs Anti-Brick Reset Routine at Controller 0x02027C.
@@ -158,6 +159,10 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
     4. If simulator_mode is True: bypasses pump/valve faults, Notlauf, and clutch open flags.
     5. Recalculates Layer-1 checksums for selected blocks only.
     Other sectors remain byte-identical. Anti-brick code lives entirely in block5.
+
+    The input must have valid Layer-1 checksums in all four blocks unless
+    correct_checksums is True, in which case mismatches are reported in the
+    result and the selected blocks are rewritten with correct checksums.
     """
     validate_image(data)
     blocks = selected_blocks(start, end)
@@ -167,8 +172,9 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
            f"computed 0x{layer1(data, a, n):04X}"
            for a, n in APP_BLOCKS
            if struct.unpack_from('<H', data, a+n-2)[0] != layer1(data, a, n)]
-    if bad:
-        raise ValueError("Input image checksum mismatch; not patched: " + "; ".join(bad))
+    if bad and not correct_checksums:
+        raise ValueError("Input image checksum mismatch; not patched: " + "; ".join(bad)
+                         + " (use --correct-checksum if these edits are intentional)")
     patch_antibrick = any(address == 0x20000 for address, _ in blocks)
     if simulator_mode:
         # Feature patches are firmware-layout specific even though the flash
@@ -244,6 +250,7 @@ def patch_firmware(data: bytearray, harden_traps: bool = True, simulator_mode: b
         "traps_hardened": traps_patched,
         "simulator_mode": simulator_mode,
         "sim_patches_applied": sim_patches_applied,
+        "input_checksum_mismatches": bad,
         "block5_csum": csums.get(0x020000),
         "block6_csum": csums.get(0x030000),
         "csums": csums,
@@ -259,13 +266,15 @@ def main(argv=None):
     parser.add_argument("output_bin", nargs="?", default=None, help="Output patched binary (optional)")
     parser.add_argument("--simulator-mode", action="store_true",
                         help="Bypass pump/valve open-circuit faults, Notlauf limp mode, and clutch open flags for bench testing")
+    parser.add_argument("--correct-checksum", action="store_true",
+                        help="Accept an input whose Layer-1 checksums are wrong and recalculate them")
     parser.add_argument("--verify", action="store_true", help="Verify checksums only; do not apply patches")
     parser.add_argument("--fix", type=lambda value: int(value, 0),
                         help="Fix only the Layer-1 checksum of this sector (CPU start address)")
     parser.add_argument("--out", help="Output for --fix (default: input file)")
     args = parser.parse_args(argv)
     if args.verify or args.fix is not None:
-        if args.simulator_mode or args.output_bin:
+        if args.simulator_mode or args.output_bin or args.correct_checksum:
             parser.error("checksum-only mode cannot be combined with patching options")
         return checksum_image(args.input_bin, args.verify, args.fix, args.out)
     if args.out:
@@ -280,8 +289,11 @@ def main(argv=None):
     validate_image(data)
 
     print(f"[*] Reading '{in_file}' ({len(data)} bytes, 320 KB CPU memory space)...")
-    res = patch_firmware(data, harden_traps=True, simulator_mode=args.simulator_mode)
+    res = patch_firmware(data, harden_traps=True, simulator_mode=args.simulator_mode,
+                         correct_checksums=args.correct_checksum)
 
+    for mismatch in res["input_checksum_mismatches"]:
+        print(f"[!] Input checksum corrected: {mismatch}")
     print(f"[+] Anti-Brick Routine installed at Controller 0x02027C ({len(ROUTINE_BYTES)} bytes)")
     print(f"[+] Anti-Brick Panic Hook installed at Controller 0x020364 ({len(HOOK_BYTES)} bytes)")
     print(f"[+] Hardened {res['traps_hardened']} dummy trap vectors (Scenario C protection active)")
@@ -416,7 +428,7 @@ SIMULATOR_MANIFEST = PatchManifest(
 
 
 def prepare_image(source, start_addr=DEFAULT_START, end_addr=DEFAULT_END,
-                  file_off=None, simulator_mode=False):
+                  file_off=None, simulator_mode=False, correct_checksums=False):
     """Prepare a Haldex image using only this controller family's patch policy."""
     if type(simulator_mode) is not bool:
         raise ValueError("simulator_mode must be a boolean")
@@ -440,7 +452,7 @@ def prepare_image(source, start_addr=DEFAULT_START, end_addr=DEFAULT_END,
     prepared = bytearray(original)
     patch_result = patch_firmware(
         prepared, harden_traps=True, simulator_mode=simulator_mode,
-        start=start_addr, end=end_addr)
+        start=start_addr, end=end_addr, correct_checksums=correct_checksums)
     image = bytes(prepared)
 
     changes = []
@@ -481,8 +493,12 @@ def prepare_image(source, start_addr=DEFAULT_START, end_addr=DEFAULT_END,
         "patches": changes,
         "patch_policy": (
             "Haldex Gen4 recovery patches, trap hardening, optional exact-manifest "
-            "simulator patches, and checksum updates in selected sectors of a checksum-valid image"
+            "simulator patches, and checksum updates in selected sectors of a "
+            + ("possibly checksum-invalid image (--correct-checksum)" if correct_checksums
+               else "checksum-valid image")
         ),
+        "correct_checksums": correct_checksums,
+        "input_checksum_mismatches": patch_result["input_checksum_mismatches"],
         "patch_result": patch_result,
         "patch_manifest": SIMULATOR_MANIFEST.name if simulator_mode else None,
         "sectors": sectors,

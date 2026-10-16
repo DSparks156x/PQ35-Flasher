@@ -323,6 +323,8 @@ class HaldexFlasher(PQFlasher):
 
 def add_cli_arguments(parser):
     parser.add_argument("--simulator-mode", action="store_true", help="Internal bench-only patch set")
+    parser.add_argument("--correct-checksum", action="store_true",
+                        help="Accept an input image with wrong Layer-1 checksums and recalculate them")
 
 
 def apply_defaults(args):
@@ -333,14 +335,14 @@ def apply_defaults(args):
 
 def validate_cli(parser, args):
     if args.readout:
-        if args.input or args.recovery or args.simulator_mode:
+        if args.input or args.recovery or args.simulator_mode or args.correct_checksum:
             parser.error("--readout cannot be combined with flash, recovery, or simulator options")
         selected_blocks(args.start, args.end)
         if args.reference:
             validate_image(Path(args.reference).read_bytes())
         return
     if args.ident_only:
-        if args.input or args.dry_run or args.simulator_mode:
+        if args.input or args.dry_run or args.simulator_mode or args.correct_checksum:
             parser.error("--ident-only cannot be combined with flash or dry-run options")
         return
     if not args.input:
@@ -350,7 +352,10 @@ def validate_cli(parser, args):
 
 def run_flash(args, runtime):
     prepared = prepare_image(args.input, args.start, args.end,
-                             simulator_mode=args.simulator_mode)
+                             simulator_mode=args.simulator_mode,
+                             correct_checksums=args.correct_checksum)
+    for mismatch in prepared["metadata"]["input_checksum_mismatches"]:
+        print(f"WARNING: input checksum corrected: {mismatch}")
     if args.dry_run:
         print(json.dumps(dict(prepared["metadata"], status="validated", dry_run=True,
                               recovery_mode=args.recovery), indent=2, sort_keys=True))

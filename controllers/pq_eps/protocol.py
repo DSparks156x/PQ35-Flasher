@@ -242,11 +242,11 @@ class PQEPSFlasher(PQFlasher):
 
     @staticmethod
     def prepare_image(source, start_addr=DEFAULT_START, end_addr=DEFAULT_END,
-                      file_off=None, simulator_mode=False):
+                      file_off=None, simulator_mode=False, correct_checksums=False):
         """Expose the common UI/controller keyword contract for EPS images."""
         return prepare_image(
             source, start_addr, end_addr, file_off=file_off,
-            simulator_mode=simulator_mode)
+            simulator_mode=simulator_mode, correct_checksums=correct_checksums)
 
     @staticmethod
     def _ident(kwp, tp):
@@ -273,6 +273,8 @@ def add_cli_arguments(parser):
     parser.add_argument(
         "--eps-sa-add", type=lambda value: int(value, 0), default=READ_KEY_ADD,
         help=f"27 03/04 additive constant (default 0x{READ_KEY_ADD:04X})")
+    parser.add_argument("--correct-checksum", action="store_true",
+                        help="Accept an input image with wrong dataset CRCs and recalculate them")
 
 
 def apply_defaults(args):
@@ -290,6 +292,8 @@ def apply_defaults(args):
 
 
 def validate_cli(parser, args):
+    if args.correct_checksum and not args.input:
+        parser.error("--correct-checksum only applies to a flash (--input)")
     if args.read_eps_can_config:
         if not args.out:
             parser.error("--read-eps-can-config requires --out FILE")
@@ -373,7 +377,12 @@ def validate_cli(parser, args):
 
 
 def run_flash(args, runtime):
-    prepared = prepare_image(args.input, args.start, args.end)
+    prepared = prepare_image(args.input, args.start, args.end,
+                             correct_checksums=args.correct_checksum)
+    for row in prepared["metadata"]["dataset_crcs"]:
+        if row["corrected"]:
+            print(f"WARNING: input checksum corrected: {row['name']} CRC at "
+                  f"0x{row['address']:05X} 0x{row['stored']:04X} -> 0x{row['computed']:04X}")
     if args.dry_run:
         print(json.dumps(dict(prepared["metadata"], status="validated", dry_run=True,
                               recovery_mode=args.recovery), indent=2, sort_keys=True))
