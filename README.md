@@ -1,13 +1,34 @@
 # PQ35 Flasher
 
-Flash and read VAG PQ35 controllers over TP2.0/KWP2000 with a J2534, Panda or
-SocketCAN adapter: the Gen4 Haldex and the EPS steering rack.
+This project contains framework code for vw TP2/KWP2000, as well as a functional flasher setup for the ZF Gen3 EPS, and the Gen4 Haldex. It also contains a patcher containing some patches for the haldex and the EPS, namely HCA min speed/timebomb patches for 3001 EPS firmware, and anti brick patches for the haldex (to avoid it ending up in an unflashable bootloop should you successfully flash a bad image to it) 
 
-This is a project to flash and readout a Gen4 VW Haldex Controller, or probably most other modules with little adaptation. It is somewhat probably derived from pq-flasher, that EPS RE project. Testing was mostly done on a clone SM2 pro, hence the 32 bit shit, panda is untested and socketcan should work.
+It can be used with a J2534, a socketcan interface, or a comma panda.
 
-The anti-brick patches trigger the haldex to drop back into bootloader ready to reflash on checksum and some other errors, rather than ending up in an unflashable bootloop. If you do not apply them, a bad checksum or some other errors will put the haldex in a bootloop, as the stock error handling routine for many things basically just freezes and lets the watchdog reset, within about 40ms. You cannot start a flash section in 40ms, and will need to open the controller and recover via BSL. See [BSLScripts](BSLScripts/README.md) for that.
+You are at your own risk using this project. I am not responsible for thermonuclear war, broken timing chains, divorce, or you being sad because your EPS no longer works if something goes wrong. 
 
-I have flashed this thing over 180 times, I have only had to recover via BSL once.
+Bricking a controller beyond recovery is difficult, but not impossible. A failed flash means that controller is not going to be functional until it is recovered, Ie, a failed EPS flash means no EPS. at all. 
+
+The flashing process is basically the following:
+
+Start Diagnostics -> Secure Access -> Start a flash session -> reset (to bootloader) -> Secure access -> Upload Data -> Verify Data -> End Flash Session -> Reset (to application)
+
+Starting a flash session sets a persistent flag to enter bootloader on boot.     Verification is a function where you send the controller a flash region you want checksumed, and the checksum for what you had uploaded, and it confirms/rejects that it matches. Then the flash session can be ended allowing the controller to reboot to application. most controllers will not allow ending without verification, and at least on the haldex, cutting power does not clear the flash session flag.
+
+This means that a flash failing mid flash doesn't result in a bricked controller, merely one that is stuck in its bootloader waiting for you to finish flashing.
+
+The bootloader lacks many identification functions you would normally use in application to verify that a controller is what you think it is to restrict flashing to only the correct binary, so recovery means skipping any of that identification or starting the flash session, and instead going straight to upload. This repo has a --recovery flag to skip those identifactions.
+
+Do not Dumbass with that. Flashing the wrong firmware to a module will brick it.
+
+Controllers can still be bricked by flashing garbage firmware to them. This repo validates that internal firmware checksums match the firmware, and faintly that a provided binary is probably correct for the relevant module in doing that. That is about it.  Flashing garbage firmware can still put a module in an unflashable state, IE, haldex firmware with incorrect checksums will cause a haldex to bootloop. It bootloops faster than a flash session can be started. It cannot be recovered via this repo. This repo prevents that particular oopsie, but still. Do not Dumbass.  Replacing a haldex controller is easy, replacing your EPS - not so much. 
+
+With that said, I have flashed my bench haldex 180 times and my eps 45+ times with various patches and otherwise havent managed to brick either of them. The EPS is flashable in all of its angry states. havent tried flashing a bad checksum to it though.
+
+If the idea of having to actually use the correct firmware binary for your hardware and the risk of bricking your EPS doesn't make sense to you, dont use this repo. Maybe at some point il make a more polished ESP based flasher dongle with a pretty UI that has safeguards etc. but this repo isnt that. 
+
+remember - 
+
+# Do not Dumb
 
 Do what you want with this stuff, more to be released about the actual editing of this binary eventually. maybe. This took a lot of human time.
 
@@ -190,13 +211,7 @@ python -m flasher.runner --module eps --input rack_384k.bin
 python -m flasher.runner --module eps --input steer_dataset_4k.bin
 ```
 
-The `0x5D` and `0x5E` blocks only exist on Gen3 racks running firmware 3000
-or newer; older firmware doesn't have those datasets. So step 1 for a rack
-below 3000 is a full firmware flash to update it. The flasher refuses a
-partial flash unless the rack reports revision 3000 or newer.
-
-The flasher never patches EPS firmware while flashing. Patch the image
-offline first, then flash the result like any other image.
+0x5E steer datasets are for >3000 firmware versions. the first step if you have <3000 firmware is to well, full firmware flash. I think. need to double check the converted SGO binaries actually contain that range. 
 
 ### EPS patches
 
@@ -212,56 +227,6 @@ Available patches:
 |---|---|---|
 | `hca-timeout-minspeed` | Zeroes the HCA disengage countdown (so HCA doesn't time out) and the HCA minimum speed | `8J0909144J` 3001, `1K0909144R` 3501 |
 
-Each patch has a separate manifest for each firmware it supports. The
-patcher picks the manifest from the software number and version in the image.
-A manifest lists the exact stock bytes at every address it changes. It
-refuses an image where any of those bytes are something else, such as a
-different firmware or someone else's edit. Patching an image that already
-has the patch changes nothing.
-
-The patcher also checks the dataset CRCs first and rewrites them afterwards.
-It replaces the `Ende` end marker with `ff ff ff ff`, like the original
-pq-flasher patcher did.
-
-The patched bytes are in the `0x5D` configuration block, so the default `0x5D`
-flash sends them along with their CRC. The end marker only goes out with a full
-firmware flash. The flasher's `--dry-run` lists any known patch it finds in an
-image (`known_patches`).
-
-These were ported from pq-flasher's `02_patcher.py` (`3001_v2_hca` and
-`3501`). The 3001 output is byte-identical to the existing
-`TT_3001_239_hca.bin`. To add another patch or firmware, add a
-`PatchManifest` to `PATCH_MANIFESTS` in `controllers/pq_eps/patches.py`.
-
-### EPS dataset checksums
-
-The datasets carry CRC-16/XMODEM words (poly `0x1021`, init 0, stored
-big-endian). The flasher checks all of them before anything is sent. Which
-words exist depends on the firmware generation, which the flasher detects
-from the `78 56 34 12` marker just before the CRC words:
-
-| Firmware | Marker at | CRC word | Covers |
-|---|---|---|---|
-| 3000+ | `0x5DFF8` | `0x5DFFC` | `0x5C000..0x5CFFE` (`0x5C` dataset) |
-| | | `0x5DFFE` | `0x5CFFF..0x5DFFB` (`0x5D` configuration) |
-| | | `0x5EFFE` | `0x5E000..0x5EFFD` (`0x5E` steer dataset) |
-| below 3000 | `0x5EFF8` | `0x5EFFC` | `0x5E000..0x5EFFB` |
-| 4 KiB `0x5E` file | | last word | the rest of the file |
-
-The odd `0x5CFFF` boundary is real: that byte (always `0xFF`) belongs to the
-`0x5D` CRC. These ranges were checked against 41 stock and tuned rack images
-from 2301 to 3501. An image with no marker is refused. So is a 4 KiB file
-that is really a `0x5D` block, since it would otherwise be flashed to
-`0x5E`.
-
-With `--correct-checksum`, a wrong CRC is only fixed when its word and all
-the data it covers are inside the flashed range. Otherwise the rack would end
-up holding a CRC that doesn't match its other blocks. For example, if you
-edited the `0x5C` dataset, flash `--start 0x5C000 --end 0x5DFFF`, not just
-the default `0x5D` block.
-
-The rack does not give its flash back over TP2/KWP, so there is no firmware
-readout. (`--readout` is an experimental probe and the rack refuses it.)
 
 **Read-only diagnostics.** None of these unlock programming, clear faults or
 write anything. Run them stationary, not while driving.
