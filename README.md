@@ -26,11 +26,14 @@ With that said, I have flashed my bench haldex 180 times and my eps 45+ times wi
 
 If the idea of having to actually use the correct firmware binary for your hardware and the risk of bricking your EPS doesn't make sense to you, dont use this repo. Maybe at some point il make a more polished ESP based flasher dongle with a pretty UI that has safeguards etc. but this repo isnt that. 
 
+Do what you want with this stuff, more to be released about the actual editing of these binaries eventually. maybe. This took a lot of human time. I know a lot more secrets about the EPS and haldex then the patches provided in this repo.
+
 remember - 
 
 # Do not Dumb
 
-Do what you want with this stuff, more to be released about the actual editing of this binary eventually. maybe. This took a lot of human time.
+The golden rule. I will laugh at you if you flash a haldex binary to your EPS. 
+
 
 ## Setup
 
