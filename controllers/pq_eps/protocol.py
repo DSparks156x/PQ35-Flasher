@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ...engine import (
-    PQFlashProfile, PQFlasher, PQMemoryReader, PQReadError, PQReadProfile,
+    ByteProgress, PQFlashProfile, PQFlasher, PQMemoryReader, PQReadError, PQReadProfile,
     SecurityAccess, add32, capture_sparse, parse_vag_identification,
 )
 from ...socketcan_device import SocketCANDevice
@@ -439,11 +439,10 @@ def run_readout(args, runtime):
         report["probe"] = probe.__dict__
         chunk = (MAX_READ_MEMORY_BLOCK if probe.method == "read-memory"
                  else min(args.readout_window, 0xFFFFFF))
+        tracker = ByteProgress(runtime.progress, "EPS READ", length)
         report["capture"] = capture_eps(
             reader, output, args.start, length, probe.method, chunk=chunk,
-            record=events.append,
-            progress=lambda done, total: runtime.progress(
-                "EPS READ", 100 * done / total, f"{done}/{total} bytes"),
+            record=events.append, progress=lambda done, total: tracker.update(done),
         )
         report["status"] = (
             "captured_complete" if report["capture"]["unreadable_bytes"] == 0

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ...engine import (
-    PQFlashProfile, PQFlasher, PQMemoryReader, PQReadError, PQReadProfile,
+    ByteProgress, PQFlashProfile, PQFlasher, PQMemoryReader, PQReadError, PQReadProfile,
     SecurityAccess, add32, capture_contiguous, encode_vag_flash_date,
     fixed_challenge, parse_vag_identification,
 )
@@ -400,15 +400,16 @@ def run_readout(args, runtime):
     try:
         device = runtime.open_adapter(args)
         tp = TP20Transport(device, module=args.module, timeout=2.0, debug=args.verbose)
-        reader = ApplicationReader(tp, events.append)
+        tracker = ByteProgress(runtime.progress, "READ", length * args.readout_passes)
+        reader = ApplicationReader(tp, tracker.recording(events.append))
         report["controller"] = reader.identification()
         args.family.validate_identification(report["controller"])
         reader.enter()
+        tracker.update(0)
         captures = capture(
             reader, output, args.start, length, args.readout_passes,
             args.readout_window, events.append,
-            lambda p, done, total: runtime.progress(
-                f"READ {p}", 100 * done / total, f"{done}/{total} bytes"),
+            lambda p, done, total: tracker.update((p - 1) * total + done),
         )
         report["captures"] = captures
         report["saved_ranges"] = {

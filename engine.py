@@ -338,6 +338,48 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest().upper()
 
 
+class ByteProgress:
+    """Byte counts -> progress(stage, percent, detail, speed, eta_sec), throttled.
+
+    Readouts move a few hundred bytes per transfer block, so reporting per
+    block gives smooth progress and a real transfer rate; per window would
+    leave the caller staring at 0% for minutes.
+    """
+
+    def __init__(self, progress, stage: str, total: int, *, interval: float = 0.25,
+                 clock=time.monotonic):
+        self.progress = progress
+        self.stage = stage
+        self.total = max(int(total), 1)
+        self.interval = interval
+        self.clock = clock
+        self.started = clock()
+        self.last = None
+        self.done = 0
+
+    def add(self, amount: int):
+        self.update(self.done + amount)
+
+    def update(self, done: int):
+        self.done = max(self.done, min(int(done), self.total))
+        now = self.clock()
+        if self.done < self.total and self.last is not None and now - self.last < self.interval:
+            return
+        self.last = now
+        speed = self.done / max(now - self.started, 1e-3)
+        eta = (self.total - self.done) / speed if speed > 0 else 0.0
+        self.progress(self.stage, 100 * self.done / self.total,
+                      f"{self.done}/{self.total} bytes", speed, eta)
+
+    def recording(self, sink):
+        """Wrap a reader `record` callback so each received block counts."""
+        def record(event):
+            sink(event)
+            if event.get("event") == "block_received":
+                self.add(event.get("length", 0))
+        return record
+
+
 def capture_contiguous(reader, output, start, length, passes, window, record, progress,
                        *, image_size, validate_selection, recover=None, max_window_retries=2,
                        protocol_errors=(PQReadError,)):
