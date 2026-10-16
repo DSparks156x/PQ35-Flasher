@@ -1,4 +1,4 @@
-"""Adapter-neutral command line for the shared Haldex flash engine."""
+"""Thin adapter, argument, and controller-dispatch shell for the PQ flasher."""
 import argparse
 import json
 import logging
@@ -96,8 +96,9 @@ def open_adapter(args):
     if args.adapter == "j2534":
         if args.bus != 0:
             raise ValueError("--bus is a Panda option; J2534 uses bus 0")
-        if struct.calcsize('P') != 4:
-            raise RuntimeError("J2534 requires 32-bit Python; use the project's Python311-32 interpreter")
+        if struct.calcsize("P") != 4:
+            raise RuntimeError(
+                "J2534 requires 32-bit Python; use the project's Python311-32 interpreter")
         from flasher.j2534 import J2534Device
         device = J2534Device(args.dll)
         try:
@@ -129,48 +130,97 @@ def open_adapter(args):
     raise ValueError(f"Unknown CAN adapter: {args.adapter}")
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="Haldex Gen4 shared flasher/readout")
+def build_parser(family=None):
+    description = "VAG TP2/KWP shared flasher/readout"
+    if family is not None:
+        description += f" ({family.name})"
+    parser = argparse.ArgumentParser(description=description)
     add_adapter_arguments(parser)
-    parser.add_argument("--module", type=number, default=0x0A)
-    parser.add_argument("--input", help="320 KiB CPU-linear image to flash")
-    parser.add_argument("--start", type=number, default=0x18000)
-    parser.add_argument("--end", type=number, default=0x4ffff,
-                        help="Inclusive end address")
+    from flasher.controllers.registry import parse_module
+    parser.add_argument(
+        "--module", type=parse_module, required=True, metavar="MODULE",
+        help="TP2 logical module ID or alias (for example awd/0x0A or eps/0x09)")
+    parser.add_argument("--input", help="CPU-linear image to flash")
+    parser.add_argument("--start", type=number)
+    parser.add_argument("--end", type=number, help="Inclusive end address")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip the destructive YES prompt")
     parser.add_argument("--ident-only", action="store_true")
     parser.add_argument("--readout", action="store_true")
-    parser.add_argument("--out", default="data/raw/readout/haldex")
+    parser.add_argument("--read-eeprom", action="store_true",
+                        help="Read the complete 1 KiB serial EEPROM (EPS only)")
+    parser.add_argument("--read-eps-faults", action="store_true",
+                        help="Capture read-only EPS KWP fault headers and snapshots")
+    parser.add_argument("--read-eps-motion", action="store_true",
+                        help="Sample the stock EPS steering-motion rate while stationary")
+    parser.add_argument("--read-eps-assist", action="store_true",
+                        help="Sample stock EPS assist stages via KWP 21 05 while stationary")
+    parser.add_argument("--read-eps-supply", action="store_true",
+                        help="Sample TT 3001 EPS raw supply proxy via KWP 21 02 while stationary")
+    parser.add_argument("--read-eps-can-config", action="store_true",
+                        help="Read TT 3001 secondary CAN configuration via KWP 21 08 while stationary")
+    parser.add_argument("--motion-samples", type=int, default=1,
+                        help="Number of stationary EPS motion samples (default 1, maximum 200)")
+    parser.add_argument("--motion-interval-ms", type=int, default=100,
+                        help="Minimum interval between EPS motion samples (default 100 ms)")
+    parser.add_argument("--assist-samples", type=int, default=1,
+                        help="Number of stationary EPS assist samples (default 1, maximum 200)")
+    parser.add_argument("--assist-interval-ms", type=int, default=100,
+                        help="Minimum interval between EPS assist samples (default 100 ms)")
+    parser.add_argument("--supply-samples", type=int, default=1,
+                        help="Number of stationary EPS supply samples (default 1, maximum 200)")
+    parser.add_argument("--supply-interval-ms", type=int, default=100,
+                        help="Minimum interval between EPS supply samples (default 100 ms)")
+    parser.add_argument("--can-config-samples", type=int, default=1,
+                        help="Number of stationary EPS CAN-config samples (default 1, maximum 200)")
+    parser.add_argument("--can-config-interval-ms", type=int, default=100,
+                        help="Minimum interval between EPS CAN-config samples (default 100 ms)")
+    parser.add_argument("--out")
     parser.add_argument("--reference")
     parser.add_argument("--readout-passes", type=int, choices=(1, 2), default=1)
     parser.add_argument("--readout-window", type=number, default=0x10000)
-    parser.add_argument("--recovery", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--simulator-mode", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--recovery", action="store_true",
+        help="Flash an already-bootloadered module; skip application identification/session entry")
     parser.add_argument("--log")
     parser.add_argument("--verbose", action="store_true")
+    if family is not None:
+        family.protocol().add_cli_arguments(parser)
     return parser
 
 
-def _validate_args(parser, args):
-    from flasher.haldex_patcher import selected_blocks, validate_image
-    if args.readout:
-        conflicts = args.input or args.recovery or args.ident_only or args.simulator_mode
-        if conflicts:
-            parser.error("--readout cannot be combined with flash, recovery, identification, or simulator options")
-        selected_blocks(args.start, args.end)
-        if args.reference:
-            validate_image(Path(args.reference).read_bytes())
-        return
-    if args.recovery:
-        parser.error("--recovery was removed; the shared engine resumes safely through the normal flash path")
+def _family_from_argv(argv):
+    from flasher.controllers.registry import family_for_module, parse_module
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--module", type=parse_module)
+    selected, _ = bootstrap.parse_known_args(argv)
+    if selected.module is None:
+        return None
+    try:
+        return family_for_module(selected.module)
+    except ValueError:
+        # Let the full parser report an unsupported raw module consistently.
+        return None
+
+
+def _operation(args):
     if args.ident_only:
-        if args.input or args.dry_run or args.simulator_mode:
-            parser.error("--ident-only cannot be combined with flash or dry-run options")
-        return
-    if not args.input:
-        parser.error("--input is required unless --readout or --ident-only is selected")
-    selected_blocks(args.start, args.end)
+        return "identify"
+    if args.read_eeprom:
+        return "eeprom"
+    if args.read_eps_faults:
+        return "faults"
+    if args.read_eps_motion:
+        return "motion"
+    if args.read_eps_assist:
+        return "assist"
+    if args.read_eps_supply:
+        return "supply"
+    if args.read_eps_can_config:
+        return "can_config"
+    if args.readout:
+        return "readout"
+    return "flash"
 
 
 def _progress(stage, percent, detail="", speed=0.0, eta_sec=0.0):
@@ -188,118 +238,73 @@ def _configure_logging(args):
                         format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
 
-def run_ident(args):
-    from flasher.haldex_flasher import HaldexFlasher
-    device = open_adapter(args)
-    flasher = HaldexFlasher(device=device, module=args.module,
-                            device_factory=lambda: open_adapter(args), progress_cb=_progress)
-    result = flasher.read_ecu_info()  # owns and closes the injected adapter
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
-
-
-def run_flash(args):
-    from flasher.artifacts import prepare_image
-    prepared = prepare_image(args.input, args.start, args.end,
-                             simulator_mode=args.simulator_mode)
-    if args.dry_run:
-        print(json.dumps(dict(prepared["metadata"], status="validated", dry_run=True),
-                         indent=2, sort_keys=True))
-        return 0
-    print(json.dumps(prepared["metadata"], indent=2, sort_keys=True))
-    if not args.yes and input("Type YES to erase and flash the selected sectors: ") != "YES":
-        print("Cancelled before adapter access.")
-        return 1
-    from flasher.haldex_flasher import HaldexFlasher
-    device = open_adapter(args)
-    flasher = HaldexFlasher(device=device, module=args.module,
-                            device_factory=lambda: open_adapter(args), progress_cb=_progress)
-    result = flasher.flash_binary(args.input, args.start, args.end,
-                                  simulator_mode=args.simulator_mode)
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
-
-
-def run_readout(args):
-    from flasher.haldex_flash import (ApplicationReader, IMAGE_SIZE, TP20Transport,
-                                      application_checksums, capture, compare_reference)
-    length = args.end - args.start + 1
-    plan = {"operation": "readout", "adapter": args.adapter, "start": args.start,
-            "end": args.end, "length": length, "passes": args.readout_passes,
-            "window": args.readout_window, "hardware_access": not args.dry_run,
-            "firmware_writes": False}
-    if args.dry_run:
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
-
-    output = Path(args.out)
-    output.mkdir(parents=True, exist_ok=False)
-    events = []
-    cleanup_errors = []
-    report = dict(plan, status="in_progress", cleanup_errors=cleanup_errors)
-    device = None
-    tp = None
-    reader = None
+def run_ident(args, runtime):
+    identify_hook = getattr(args.family.protocol(), "run_ident", None)
+    if identify_hook is not None:
+        return identify_hook(args, runtime)
+    from flasher.engine import parse_vag_identification
+    from flasher.vag_protocols.kwp import KWPClient
+    from flasher.vag_protocols.tp2 import TP20Transport
+    device = tp = None
     try:
-        device = open_adapter(args)
-        tp = TP20Transport(device, module=args.module, timeout=2.0, debug=args.verbose)
-        reader = ApplicationReader(tp, events.append)
-        report["identification_hex"] = reader.identify().hex()
-        reader.enter()
-        captures = capture(
-            reader, output, args.start, length, args.readout_passes,
-            args.readout_window, events.append,
-            lambda p, done, total: _progress(f"READ {p}", 100 * done / total,
-                                             f"{done}/{total} bytes"),
-        )
-        report["captures"] = captures
-        report["saved_ranges"] = {
-            item["path"]: {"start": args.start, "end_exclusive": args.end + 1}
-            for item in captures
-        }
-        captured = (output / captures[0]["path"]).read_bytes()[args.start:args.end + 1]
-        checksums = application_checksums(captured, args.start)
-        report["application_checksums"] = checksums
-        if args.reference:
-            report["comparisons"] = [compare_reference(captured, args.start, args.reference)]
-        invalid = any(row["valid"] is False for row in checksums)
-        report["status"] = "checksum_mismatch" if invalid else "captured_checksums_valid"
-    except Exception as exc:
-        report.update(status="requires_attention", error=f"{type(exc).__name__}: {exc}")
+        device = runtime.open_adapter(args)
+        protocol_log = logging.getLogger("ModuleIdentify").info
+        tp = TP20Transport(device, module=args.module, timeout=2.0,
+                           debug=args.verbose, log_fn=protocol_log)
+        kwp = KWPClient(tp, debug=args.verbose, log_fn=protocol_log)
+        result = parse_vag_identification(
+            kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C))
+        decorate = getattr(args.family.protocol(), "decorate_identification", None)
+        if decorate is not None:
+            result = decorate(result)
+        args.family.validate_identification(result)
+        result.update(connected=True, module=args.module,
+                      controller_family=args.family.name)
     finally:
-        if reader is not None:
-            cleanup_errors.extend(reader.leave())
         if tp is not None:
-            try:
-                tp.disconnect()
-            except Exception as exc:
-                cleanup_errors.append(f"disconnect: {exc}")
+            tp.disconnect()
         if device is not None:
-            try:
-                device.close()
-            except Exception as exc:
-                cleanup_errors.append(f"adapter close: {exc}")
-        if cleanup_errors:
-            report["status"] = "requires_attention"
-        (output / "events.json").write_text(json.dumps(events, indent=2), encoding="utf-8")
-        (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["status"] == "captured_checksums_valid" else 1
+            device.close()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 def main(argv=None):
-    parser = build_parser()
+    from flasher.controllers.registry import family_for_module
+    from flasher.engine import ControllerRuntime
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    family = _family_from_argv(argv)
+    parser = build_parser(family)
     args = parser.parse_args(argv)
+    if sum((args.ident_only, args.readout, args.read_eeprom, args.read_eps_faults,
+            args.read_eps_motion, args.read_eps_assist, args.read_eps_supply,
+            args.read_eps_can_config)) > 1:
+        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply and CAN-config operations cannot be combined")
+    operation = _operation(args)
+    if operation != "motion" and (args.motion_samples != 1 or args.motion_interval_ms != 100):
+        parser.error("--motion-samples and --motion-interval-ms require --read-eps-motion")
+    if operation != "assist" and (args.assist_samples != 1 or args.assist_interval_ms != 100):
+        parser.error("--assist-samples and --assist-interval-ms require --read-eps-assist")
+    if operation != "supply" and (args.supply_samples != 1 or args.supply_interval_ms != 100):
+        parser.error("--supply-samples and --supply-interval-ms require --read-eps-supply")
+    if operation != "can_config" and (args.can_config_samples != 1 or args.can_config_interval_ms != 100):
+        parser.error("--can-config-samples and --can-config-interval-ms require --read-eps-can-config")
     try:
-        _validate_args(parser, args)
+        args.family = family_for_module(args.module, operation=operation)
+        if args.recovery and operation != "flash":
+            parser.error("--recovery cannot be combined with readout or identification")
+        controller = args.family.protocol()
+        controller.apply_defaults(args)
+        controller.validate_cli(parser, args)
     except ValueError as exc:
         parser.error(str(exc))
+
     _configure_logging(args)
-    if args.readout:
-        return run_readout(args)
-    if args.ident_only:
-        return run_ident(args)
-    return run_flash(args)
+    runtime = ControllerRuntime(open_adapter=open_adapter, progress=_progress)
+    if operation == "identify":
+        return run_ident(args, runtime)
+    return getattr(controller, f"run_{operation}")(args, runtime)
 
 
 if __name__ == "__main__":

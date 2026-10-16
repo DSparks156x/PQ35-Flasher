@@ -138,7 +138,7 @@ def run_can_unlock(port: str, baud: int):
     print("[*] The ECU is now PERMANENTLY LOCKED in CAN Bootloader mode!")
     print("[*] You can remove the P0L.4 ground wire now (leave 12V power ON).")
     print("\n[*] Now run the CAN flasher to flash the corrected firmware:")
-    print("    py -3.11-32 flasher/runner.py --input haldex_flash_haldex67motion.bin --start 0x020000 --end 0x02FFFF\n")
+    print("    py -3.11-32 flasher/runner.py --module awd --recovery --input haldex_flash_haldex67motion.bin --start 0x020000 --end 0x02FFFF\n")
 
 
 def main():

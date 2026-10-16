@@ -80,7 +80,7 @@ def main():
     print("\n[+] SUCCESS! RAM flag 0x001119AB written and User Bootloader launched.")
     print("[*] The ECU is now locked in CAN Bootloader mode indefinitely.")
     print("[*] You may now disconnect the UART adapter and flash over CAN:")
-    print("    py -3.11-32 flasher/runner.py --input haldex_flash_haldex67motion.bin --start 0x020000 --end 0x02FFFF")
+    print("    py -3.11-32 flasher/runner.py --module awd --recovery --input haldex_flash_haldex67motion.bin --start 0x020000 --end 0x02FFFF")
 
 if __name__ == "__main__":
     main()

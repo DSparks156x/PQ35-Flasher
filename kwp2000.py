@@ -7,7 +7,7 @@ third-party callers without maintaining a second KWP implementation.
 import struct
 from enum import IntEnum
 
-from vag_protocols.kwp import KWPClient, KWPError, KWPNegativeResponse, KWPProfile
+from .vag_protocols.kwp import KWPClient, KWPError, KWPNegativeResponse, KWPProfile
 
 
 class NegativeResponseError(Exception):
