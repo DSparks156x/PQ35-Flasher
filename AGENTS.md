@@ -22,10 +22,5 @@ measuring-block read before claiming that the ECU is running. Do not infer
 dynamic tune validation from an idle BeamNG capture. Bench recovery hardware
 is not a reason to use parallel hardware agents.
 
-The Haldex vehicle artifact must retain stock fault handling. The
-`--simulator-mode` overlay is only for the bench simulator. Current image
-hashes and build paths are in HaldexRE's root `AGENTS.md` and
-`docs/KNOWN_GOOD_FILES.md`.
 
-Regression tests live in the consuming projects (HaldexRE and RNS-E-Hudiy
-`tests/`); run both suites after changing shared transport or engine code.
+
