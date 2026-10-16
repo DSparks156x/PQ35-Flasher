@@ -379,7 +379,7 @@ def validate_cli(parser, args):
 def run_flash(args, runtime):
     prepared = prepare_image(args.input, args.start, args.end,
                              correct_checksums=args.correct_checksum)
-    for row in prepared["metadata"]["dataset_crcs"]:
+    for row in prepared["metadata"].get("dataset_crcs", ()):
         if row["corrected"]:
             print(f"WARNING: input checksum corrected: {row['name']} CRC at "
                   f"0x{row['address']:05X} 0x{row['stored']:04X} -> 0x{row['computed']:04X}")

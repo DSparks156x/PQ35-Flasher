@@ -354,7 +354,7 @@ def run_flash(args, runtime):
     prepared = prepare_image(args.input, args.start, args.end,
                              simulator_mode=args.simulator_mode,
                              correct_checksums=args.correct_checksum)
-    for mismatch in prepared["metadata"]["input_checksum_mismatches"]:
+    for mismatch in prepared["metadata"].get("input_checksum_mismatches", ()):
         print(f"WARNING: input checksum corrected: {mismatch}")
     if args.dry_run:
         print(json.dumps(dict(prepared["metadata"], status="validated", dry_run=True,
