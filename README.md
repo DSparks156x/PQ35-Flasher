@@ -81,10 +81,12 @@ python -m flasher.runner --module eps --input rack_384k.bin
 python -m flasher.runner --module eps --input steer_dataset_4k.bin
 ```
 
-A partial (`0x5D` or `0x5E`) flash is only allowed when the rack reports
-software revision 3000 or newer; older or unknown racks need the full
-firmware flash. The EPS image is never modified: the flasher only calculates
-the loader checksum over the selected range.
+The `0x5D` and `0x5E` blocks only exist on Gen3 racks running firmware 3000
+or newer; older firmware doesn't have those datasets. So step 1 for a rack
+below 3000 is a full firmware flash to update it. The flasher refuses a
+partial flash unless the rack reports revision 3000 or newer. The EPS image
+is never modified: the flasher only calculates the loader checksum over the
+selected range.
 
 The rack does not give its flash back over TP2/KWP, so there is no firmware
 readout. (`--readout` is an experimental probe and the rack refuses it.)
