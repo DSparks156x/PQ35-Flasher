@@ -50,8 +50,9 @@ class ReadoutCancelled(ProtocolError):
 
 class HaldexReadout:
     """Owns one device; callers acquire the shared diagnostic/Flashing Mode lease."""
-    def __init__(self, channel='can0', progress_cb=None, log_cb=None):
+    def __init__(self, channel=None, progress_cb=None, log_cb=None, interface='socketcan'):
         self.channel = channel
+        self.interface = interface
         self.progress_cb = progress_cb or (lambda *args: None)
         self.log_cb = log_cb or (lambda message: None)
         self.abort_requested = False
@@ -116,7 +117,7 @@ class HaldexReadout:
                     persist()
             try:
                 self.progress_cb('READING', 0, 'Connecting for firmware readout', 0, 0)
-                self.device = SocketCANDevice(channel=self.channel)
+                self.device = SocketCANDevice(channel=self.channel, interface=self.interface)
                 self.device.can_clear()
                 self.transport = TP20Transport(self.device, module=0x0a, timeout=2.0, debug=True,
                     log_fn=lambda message: record({'event': 'tp20', 'message': message}))
@@ -193,8 +194,9 @@ def eps_automatic_filename(info, start, end, timestamp):
 class PQEPSReadout:
     """Experimental non-mutating conventional-KWP EPS readout."""
 
-    def __init__(self, channel='can0', progress_cb=None, log_cb=None):
+    def __init__(self, channel=None, progress_cb=None, log_cb=None, interface='socketcan'):
         self.channel = channel
+        self.interface = interface
         self.progress_cb = progress_cb or (lambda *args: None)
         self.log_cb = log_cb or (lambda message: None)
         self.abort_requested = False
@@ -254,7 +256,7 @@ class PQEPSReadout:
 
             try:
                 self.progress_cb('EPS_READING', 0, 'Connecting for experimental EPS readout', 0, 0)
-                self.device = SocketCANDevice(channel=self.channel)
+                self.device = SocketCANDevice(channel=self.channel, interface=self.interface)
                 self.device.can_clear()
                 self.transport = TP20Transport(
                     self.device, module=0x09, timeout=2.0, debug=True,
@@ -363,7 +365,7 @@ class PQEPSEepromReadout(PQEPSReadout):
             try:
                 self.progress_cb('EPS_EEPROM_READING', 0,
                                  'Connecting to read the 1 KiB EPS EEPROM', 0, 0)
-                self.device = SocketCANDevice(channel=self.channel)
+                self.device = SocketCANDevice(channel=self.channel, interface=self.interface)
                 self.device.can_clear()
                 self.transport = TP20Transport(
                     self.device, module=0x09, timeout=2.0, debug=True,

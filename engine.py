@@ -431,7 +431,7 @@ logger = logging.getLogger("PQFlasher")
 
 
 class PQFlasher:
-    def __init__(self, profile: PQFlashProfile, *, channel: str = "can0",
+    def __init__(self, profile: PQFlashProfile, *, channel: Optional[str] = None,
                  module: Optional[int] = None, device: Optional[Any] = None,
                  device_factory: Optional[Callable[[], Any]] = None,
                  progress_cb: Optional[Callable[..., None]] = None,

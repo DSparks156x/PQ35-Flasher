@@ -53,6 +53,7 @@ uses the standard library. Which extra you need depends on your adapter:
 | --- | --- | --- |
 | J2534 (default, Windows) | **32-bit** (the J2534 DLLs are 32-bit) | nothing; just install your adapter's J2534 driver |
 | SocketCAN (Linux) | any | `python -m pip install -r requirements-socketcan.txt` (`python-can`) |
+| gs_usb / candleLight (Windows or Linux, untested) | any | `python -m pip install -r requirements-gs_usb.txt` (`python-can`, `gs_usb`, `pyusb`, `libusb-package`) |
 | Panda (untested) | any | `python -m pip install -r requirements-panda.txt` (`pandacan`) |
 | BSL recovery scripts | any | `python -m pip install -r BSLScripts/requirements.txt` (`pyserial`) |
 
@@ -250,11 +251,21 @@ file; see `python -m flasher.runner --module eps --help`.
 ```bash
 python -m flasher.runner --module awd --adapter panda --bus 0 --readout --out haldex_readout
 python -m flasher.runner --module awd --adapter socketcan --channel can0 --readout --out haldex_readout
+python -m flasher.runner --module awd --adapter gs_usb --channel 0 --readout --out haldex_readout
 ```
 
 Panda: `--serial` picks the device, `--bus 0|1|2` the CAN bus, `--baud` the
 bitrate (default 500000). SocketCAN: bring the interface up at the right
 bitrate yourself first; `--baud` does not apply.
+
+gs_usb (untested): for candleLight-firmware adapters (CANable, candleLight,
+CANtact and similar) without SocketCAN, which is the normal case on Windows.
+`--channel` is the USB device index (default 0, in libusb scan order) and
+`--baud` sets the bitrate. candleLight firmware asks Windows for the WinUSB
+driver itself; if the device does not open, bind WinUSB to it with Zadig. The
+adapter echoes every transmitted frame and the echoes are dropped. On Linux
+the kernel `gs_usb` driver normally claims the device, so use `--adapter
+socketcan` there instead.
 
 Other useful options: `--ident-only` (just identify the module), `--yes` (skip
 the `YES` prompt), `--verbose` (raw frame trace), `--log FILE`.
@@ -266,7 +277,8 @@ the `YES` prompt), `--verbose` (raw frame trace), `--log FILE`.
 - `controllers/`: one package per controller (`haldex_gen4`, `pq_eps`, and an
   untested read-only `pq_bcm`) with its addresses, security and image rules.
 - `vag_protocols/`: TP2 and KWP2000.
-- `j2534.py`, `socketcan_device.py`: adapter bindings.
+- `j2534.py`, `socketcan_device.py`: adapter bindings. The flasher and readout
+  classes take `interface="gs_usb"` (default `"socketcan"`) and a `channel`.
 - `readout.py`, `traffic.py`: used by the RNS-E-Hudiy web UI (readout
   progress, and pausing other CAN traffic during a flash).
 

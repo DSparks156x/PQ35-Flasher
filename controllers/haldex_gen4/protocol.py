@@ -272,18 +272,19 @@ def make_haldex_profile(*, kwp_factory, prepare_image, device_factory,
 class HaldexFlasher(PQFlasher):
     """Haldex Gen4 binding backed by the controller-neutral PQ lifecycle."""
 
-    def __init__(self, channel: str = "can0", module: int = AWD_MODULE_ADDR,
+    def __init__(self, channel: Optional[str] = None, module: int = AWD_MODULE_ADDR,
                  device: Optional[Any] = None,
                  device_factory: Optional[Callable[[], Any]] = None,
                  progress_cb: Optional[Callable[..., None]] = None,
                  log_cb: Optional[Callable[[str], None]] = None,
-                 debug: bool = False):
+                 debug: bool = False, interface: str = "socketcan"):
         # Resolve module globals at call time so tests and applications can
         # replace the adapter or artifact preparation boundary explicitly.
         profile = make_haldex_profile(
             kwp_factory=lambda tp, log, debug: Kwp(tp, log_fn=log, debug=debug),
             prepare_image=lambda *args, **kwargs: prepare_image(*args, **kwargs),
-            device_factory=lambda selected_channel: SocketCANDevice(channel=selected_channel),
+            device_factory=lambda selected_channel: SocketCANDevice(
+                channel=selected_channel, interface=interface),
             transport_factory=lambda *args, **kwargs: TP20Transport(*args, **kwargs),
             identify=lambda kwp, tp: self._ident(kwp, tp),
         )

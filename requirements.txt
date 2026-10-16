@@ -3,5 +3,6 @@
 #
 # Install the extras for the adapter you use:
 #   SocketCAN (Linux):  python -m pip install -r requirements-socketcan.txt
+#   gs_usb/candleLight: python -m pip install -r requirements-gs_usb.txt
 #   Panda (comma.ai):   python -m pip install -r requirements-panda.txt
 #   BSL recovery:       python -m pip install -r BSLScripts/requirements.txt

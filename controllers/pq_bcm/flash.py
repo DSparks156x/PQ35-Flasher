@@ -210,13 +210,14 @@ def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,
 
 
 class PQBCMFlasher(PQFlasher):
-    def __init__(self, loader: LoaderConfig, *, channel="can0", module=BCM_MODULE_ADDR,
-                 device=None, device_factory=None, progress_cb=None, log_cb=None, debug=False):
+    def __init__(self, loader: LoaderConfig, *, channel=None, module=BCM_MODULE_ADDR,
+                 device=None, device_factory=None, progress_cb=None, log_cb=None, debug=False,
+                 interface="socketcan"):
         from ...socketcan_device import SocketCANDevice
         profile = make_bcm_flash_profile(
             loader,
             kwp_factory=lambda tp, log, dbg: KWPClient(tp, log_fn=log, debug=dbg),
-            device_factory=lambda ch: SocketCANDevice(channel=ch),
+            device_factory=lambda ch: SocketCANDevice(channel=ch, interface=interface),
             transport_factory=lambda *a, **k: TP2Transport(*a, **k),
             identify=lambda kwp, tp: {"part_number": codec.parse_part_number_response(
                 kwp.request(codec.part_number_request())), "connected": True},

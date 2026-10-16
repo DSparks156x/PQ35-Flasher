@@ -16,13 +16,14 @@ def number(value):
 
 
 def add_adapter_arguments(parser, default="j2534"):
-    parser.add_argument("--adapter", choices=("j2534", "panda", "socketcan"), default=default)
+    parser.add_argument("--adapter", choices=("j2534", "panda", "socketcan", "gs_usb"), default=default)
     parser.add_argument("--dll", help="J2534 DLL path (default: registry discovery)")
     parser.add_argument("--baud", type=int, default=500000)
     parser.add_argument("--bus", type=int, choices=(0, 1, 2), default=0,
                         help="Physical Panda CAN bus; protocol sees logical bus 0")
     parser.add_argument("--serial", help="Panda serial number")
-    parser.add_argument("--channel", default="can0", help="SocketCAN interface (default can0)")
+    parser.add_argument("--channel",
+                        help="SocketCAN interface (default can0) or gs_usb device index (default 0)")
 
 
 class PandaAdapter:
@@ -62,11 +63,11 @@ class PandaAdapter:
             self.device.close()
 
 
-class SocketCANAdapter:
-    def __init__(self, bus, message_type, channel):
+class PythonCANAdapter:
+    def __init__(self, bus, message_type, description):
         self.device = bus
         self.message_type = message_type
-        self.description = f"SocketCAN {channel}"
+        self.description = description
 
     def can_send(self, address, data, bus=0):
         self.device.send(self.message_type(arbitration_id=address, data=data,
@@ -74,8 +75,9 @@ class SocketCANAdapter:
 
     def can_recv(self, timeout_ms=10):
         message = self.device.recv(timeout=timeout_ms / 1000)
-        if (message is None or message.is_error_frame or message.is_remote_frame
-                or message.is_extended_id):
+        # gs_usb reports our own transmitted frames back as is_rx=False echoes.
+        if (message is None or not getattr(message, "is_rx", True) or message.is_error_frame
+                or message.is_remote_frame or message.is_extended_id):
             return []
         return [(message.arbitration_id, bytes(message.data), 0)]
 
@@ -121,12 +123,15 @@ def open_adapter(args):
         except BaseException:
             adapter.close()
             raise
-    if args.adapter == "socketcan":
+    if args.adapter in ("socketcan", "gs_usb"):
         if args.bus != 0:
-            raise ValueError("Use --channel to select SocketCAN; --bus is a Panda option")
+            raise ValueError("Use --channel to select the python-can channel; --bus is a Panda option")
         import can
-        bus = can.Bus(interface="socketcan", channel=args.channel, receive_own_messages=False)
-        return SocketCANAdapter(bus, can.Message, args.channel)
+        from flasher.socketcan_device import default_channel, open_can_bus
+        channel = default_channel(args.adapter) if args.channel is None else args.channel
+        bus = open_can_bus(args.adapter, channel, args.baud)
+        name = "SocketCAN" if args.adapter == "socketcan" else "gs_usb device"
+        return PythonCANAdapter(bus, can.Message, f"{name} {channel}")
     raise ValueError(f"Unknown CAN adapter: {args.adapter}")
 
 

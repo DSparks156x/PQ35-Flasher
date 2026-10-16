@@ -222,17 +222,18 @@ def make_eps_flash_profile(*, kwp_factory, image_preparer, device_factory,
 class PQEPSFlasher(PQFlasher):
     """PQ EPS binding backed by the controller-neutral PQ lifecycle."""
 
-    def __init__(self, channel: str = "can0", module: int = EPS_MODULE_ADDR,
+    def __init__(self, channel: Optional[str] = None, module: int = EPS_MODULE_ADDR,
                  device: Optional[Any] = None,
                  device_factory: Optional[Callable[[], Any]] = None,
                  progress_cb: Optional[Callable[..., None]] = None,
                  log_cb: Optional[Callable[[str], None]] = None,
-                 debug: bool = False):
+                 debug: bool = False, interface: str = "socketcan"):
         profile = make_eps_flash_profile(
             kwp_factory=lambda tp, log, debug: EPSKWPClient(
                 tp, log_fn=log, debug=debug),
             image_preparer=lambda *args, **kwargs: prepare_image(*args, **kwargs),
-            device_factory=lambda selected_channel: SocketCANDevice(channel=selected_channel),
+            device_factory=lambda selected_channel: SocketCANDevice(
+                channel=selected_channel, interface=interface),
             transport_factory=lambda *args, **kwargs: TP20Transport(*args, **kwargs),
             identify=lambda kwp, tp: self._ident(kwp, tp),
         )
