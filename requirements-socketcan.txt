@@ -1,0 +1,2 @@
+# --adapter socketcan
+python-can>=4.0

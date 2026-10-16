@@ -22,8 +22,17 @@ git submodule add https://github.com/DSparks156x/PQ35-Flasher.git flasher
 git clone https://github.com/DSparks156x/PQ35-Flasher.git flasher
 ```
 
-J2534 needs **32-bit Python** (the J2534 DLLs are 32-bit). Panda and SocketCAN
-work with any Python; they need the comma.ai `panda` package or `python-can`.
+Tested on Python 3.11 (32-bit) and 3.12. The flasher itself only
+uses the standard library. Which extra you need depends on your adapter:
+
+| Adapter | Python | Install |
+| --- | --- | --- |
+| J2534 (default, Windows) | **32-bit** (the J2534 DLLs are 32-bit) | nothing; just install your adapter's J2534 driver |
+| SocketCAN (Linux) | any | `python -m pip install -r requirements-socketcan.txt` (`python-can`) |
+| Panda (untested) | any | `python -m pip install -r requirements-panda.txt` (`pandacan`) |
+| BSL recovery scripts | any | `python -m pip install -r BSLScripts/requirements.txt` (`pyserial`) |
+
+Run these from inside the checkout.
 
 All examples use `python -m flasher.runner`. Add `--dry-run` to a flash or
 readout command to check the plan without touching CAN. A real flash asks you

@@ -1,0 +1,7 @@
+# The flasher itself uses only the Python standard library. With the default
+# J2534 adapter (32-bit Python on Windows) nothing needs installing.
+#
+# Install the extras for the adapter you use:
+#   SocketCAN (Linux):  python -m pip install -r requirements-socketcan.txt
+#   Panda (comma.ai):   python -m pip install -r requirements-panda.txt
+#   BSL recovery:       python -m pip install -r BSLScripts/requirements.txt

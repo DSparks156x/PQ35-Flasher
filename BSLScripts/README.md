@@ -35,7 +35,7 @@ adapter's port. Use only one serial script or CAN flasher at a time.
 
 ```powershell
 $python = 'C:\Users\raccoon\AppData\Local\Programs\Python\Python311-32\python.exe'
-& $python -m pip install pyserial
+& $python -m pip install -r requirements.txt
 & $python -m serial.tools.list_ports
 ```
 

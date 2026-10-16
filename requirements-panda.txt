@@ -1,0 +1,2 @@
+# --adapter panda (untested). The PyPI package installs as `panda`.
+pandacan
