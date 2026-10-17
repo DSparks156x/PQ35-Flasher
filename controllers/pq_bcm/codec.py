@@ -103,6 +103,19 @@ PAGE_FF_GLOBAL_START = 0x7FC000
 PAGE_FF_SIZE = PAGE_FF_END - PAGE_FF_START
 PAGE_FF_CHUNK = 0x40
 
+# Full logical EEPROM (byte offsets 0x000..0xFFF). Reads use the same bare
+# offset with high byte 0x00 that the existing named EEPROM targets use
+# (0x000586, 0x000FA0, 0x00057D), so the full window is encoded addresses
+# 0x000000..0x000FFF. Firmware splits the logical EEPROM into 1 KiB EPAGEs, and
+# a single read must not cross a 0x400-aligned boundary; CHUNK 0x40 is <= the
+# 0x43 upload max and divides 0x400 cleanly, so each read needs one final 76
+# response and stays inside one EPAGE. Read-only; returns raw triplicates.
+EEPROM_TARGET = "eeprom"
+EEPROM_LOGICAL_START = 0x000000
+EEPROM_SIZE = 0x1000
+EEPROM_EPAGE = 0x400
+EEPROM_CHUNK = 0x40
+
 
 def in_page_ff_window(address: int, length: int) -> bool:
     return (type(address) is int and type(length) is int
@@ -110,15 +123,27 @@ def in_page_ff_window(address: int, length: int) -> bool:
             and PAGE_FF_START <= address and address + length <= PAGE_FF_END)
 
 
+def in_eeprom_window(address: int, length: int) -> bool:
+    """True iff a 1..0x40-byte read lies inside 0x000..0xFFF and one EPAGE."""
+    return (type(address) is int and type(length) is int
+            and 1 <= length <= EEPROM_CHUNK
+            and EEPROM_LOGICAL_START <= address
+            and address + length <= EEPROM_SIZE
+            and address // EEPROM_EPAGE == (address + length - 1) // EEPROM_EPAGE)
+
+
 def upload_target(address: int, length: int) -> str:
-    """Return the named target, or PAGE_FF_TARGET, covering exactly this read."""
+    """Return the named target, PAGE_FF_TARGET or EEPROM_TARGET for this read."""
     for name, target in TARGETS.items():
         if (address, length) == (target.encoded_address, target.length):
             return name
     if in_page_ff_window(address, length):
         return PAGE_FF_TARGET
-    raise ProtocolError("Only exact reviewed named BCM read targets or 1..64-byte "
-                        "page FF alias reads (0x80C000..0x80FFFF) are enabled")
+    if in_eeprom_window(address, length):
+        return EEPROM_TARGET
+    raise ProtocolError("Only exact reviewed named BCM read targets, 1..64-byte "
+                        "page FF alias reads (0x80C000..0x80FFFF), or 1..64-byte "
+                        "single-EPAGE logical EEPROM reads (0x000..0xFFF) are enabled")
 
 
 DEFAULT_TARGETS = (

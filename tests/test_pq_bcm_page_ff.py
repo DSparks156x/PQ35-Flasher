@@ -91,9 +91,11 @@ class PageFFProtocolTests(unittest.TestCase):
         self.assertFalse(transport.replies)
 
     def test_out_of_window_or_oversized_uploads_are_refused(self):
+        # 0x000000/0x40 is now a valid logical-EEPROM read, so the "outside every
+        # window" probe uses 0x400000 instead (no named/page-FF/EEPROM target).
         for address, length in ((0x80BFC0, 0x40), (0x80FFC1, 0x40), (0x80C000, 0x41),
                                 (0x80C000, 0x200), (0x810000, 1), (0x7FC000, 0x40),
-                                (0x80C000, 0), (0x000000, 0x40)):
+                                (0x80C000, 0), (0x400000, 0x40)):
             with self.subTest(address=hex(address), length=length):
                 with self.assertRaises(ValueError):
                     validate_range(address, length)

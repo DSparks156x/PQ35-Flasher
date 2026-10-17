@@ -321,6 +321,34 @@ class PQBCMReader(PQMemoryReader):
                 progress_cb(index + 1, count, address)
         return bytes(data)
 
+    def read_eeprom_full(self, progress_cb=None) -> bytes:
+        """Dump the full 4 KiB logical EEPROM (byte offsets 0x000..0xFFF).
+
+        Strictly read-only: identity, then the shared single-attempt
+        seed/key/session86 entry, then 64 sequential 35/36/37 uploads of 0x40
+        bytes across encoded 0x000000..0x000FFF. Each read stays inside one
+        0x400 EPAGE. No download, erase, write or coding request is permitted
+        by _allowed(). Returns raw triplicates. progress_cb receives
+        (chunk_number, chunk_count, offset) after each chunk.
+        """
+        if self._identity is None:
+            raise PQReadError("Identify the BCM before reading the EEPROM")
+        if not self._read_session_verified:
+            self.enter()
+        count = codec.EEPROM_SIZE // codec.EEPROM_CHUNK
+        data = bytearray()
+        for index in range(count):
+            offset = codec.EEPROM_LOGICAL_START + index * codec.EEPROM_CHUNK
+            block = self.read_window(offset, codec.EEPROM_CHUNK)
+            if len(block) != codec.EEPROM_CHUNK:
+                raise PQReadError(f"EEPROM chunk at 0x{offset:06X}: got {len(block)} bytes")
+            data.extend(block)
+            self.record({"event": "eeprom_chunk", "chunk": index + 1, "chunks": count,
+                         "offset": offset})
+            if progress_cb is not None:
+                progress_cb(index + 1, count, offset)
+        return bytes(data)
+
     def probe(self, addresses, *, requested="auto"):
         raise PQReadError("BCM automatic address/service probing is disabled")
 
@@ -579,7 +607,8 @@ def run_backup(args, runtime):
     if args.dry_run:
         manifest["status"] = "dry_run"
         manifest["plan"] = {"diagnostics": sorted(codec.TARGETS),
-                            "pageff": "global 0x7FC000..0x7FFFFF (16 KiB)"}
+                            "pageff": "global 0x7FC000..0x7FFFFF (16 KiB)",
+                            "eeprom": "logical 0x000..0xFFF (4 KiB)"}
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
     if base.exists() and any(base.iterdir()):
@@ -606,7 +635,45 @@ def run_backup(args, runtime):
     except Exception as error:
         manifest["components"]["pageff"] = {"error": str(error)}
 
-    manifest["status"] = ("ok" if diag_code == 0 and "error" not in manifest["components"]["pageff"]
+    # 3) Full 4 KiB logical EEPROM (raw triplicates, offsets 0x000..0xFFF), read
+    #    through the same bounded application upload path as the named targets.
+    device = transport = reader = None
+    try:
+        progress_cb = None
+        if getattr(runtime, "progress", None) is not None:
+            def progress_cb(index, count, offset):
+                runtime.progress("eeprom", 100.0 * index / count,
+                                 f"chunk {index}/{count} @ 0x{offset:03X}")
+        device = CheckedCANDevice(runtime.open_adapter(args))
+        transport = TP2Transport(device, module=BCM_MODULE_ADDR, bus=0,
+                                 timeout=2.0, debug=args.verbose)
+        reader = PQBCMReader(transport)
+        reader.identification()
+        eeprom = reader.read_eeprom_full(progress_cb=progress_cb)
+        path = base / "eeprom.bin"
+        path.write_bytes(eeprom)
+        manifest["components"]["eeprom"] = {"path": str(path),
+                                            "sha256": hashlib.sha256(eeprom).hexdigest(),
+                                            "size": len(eeprom)}
+    except Exception as error:
+        manifest["components"]["eeprom"] = {"error": str(error)}
+    finally:
+        if reader is not None:
+            reader.leave()
+        if transport is not None:
+            try:
+                transport.disconnect()
+            except Exception:
+                pass
+        if device is not None:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+    manifest["status"] = ("ok" if diag_code == 0
+                          and "error" not in manifest["components"]["pageff"]
+                          and "error" not in manifest["components"]["eeprom"]
                           else "partial")
     with (base / "backup_manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, indent=2, sort_keys=True)
