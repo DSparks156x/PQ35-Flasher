@@ -14,6 +14,9 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 BROADCAST_ADDR = 0x200
 TIMING_UNITS_MS = (0.1, 1.0, 10.0, 100.0)
+# SAE J2819 T_WAIT and bounded explicit block-recovery count.
+NOT_READY_WAIT_SECONDS = 0.100
+MAX_BLOCK_RETRIES = 5
 # Block size 15, T1 100 ms, T3 5 ms. A0 requests them; A1 answers A0 and A3.
 CHANNEL_PARAMETERS_REQUEST = b"\xA0\x0F\x8A\xFF\x32\xFF"
 CHANNEL_PARAMETERS_RESPONSE = b"\xA1\x0F\x8A\xFF\x32\xFF"
@@ -324,8 +327,30 @@ class TP2Transport:
         self.can_send(CHANNEL_PARAMETERS_REQUEST)
         self._apply_parameters(self.can_recv())
 
-    def wait_for_ack(self, sent_sequence: int):
-        expected = 0xB0 | ((sent_sequence + 1) & 0x0F)
+    def wait_for_ack(self, sent_sequence: int,
+                     pending_frames: Optional[Sequence[bytes]] = None):
+        """Wait for ACK; replay only an explicit request inside the pending block.
+
+        ACK sequence numbers name the next frame the receiver expects. A 9n
+        additionally requires T_WAIT before the next data frame; it does not
+        require a separate readiness handshake when n already acknowledges all
+        frames. Silence never requests retransmission.
+        """
+        if not 0 <= sent_sequence <= 0x0F:
+            raise ValueError("TP2 sequence must be 0..15")
+        expected_sequence = (sent_sequence + 1) & 0x0F
+        expected = 0xB0 | expected_sequence
+        pending = tuple(bytes(frame) for frame in pending_frames or ())
+        if pending:
+            sequences = [frame[0] & 0x0F for frame in pending if frame]
+            if (len(pending) > 15 or len(sequences) != len(pending)
+                    or sequences[-1] != sent_sequence
+                    or any(sequence != ((sequences[0] + i) & 0x0F)
+                           for i, sequence in enumerate(sequences))
+                    or any(frame[0] >> 4 != 2 for frame in pending[:-1])
+                    or pending[-1][0] >> 4 not in (0, 1)):
+                raise TP2Error("Invalid or ambiguous outstanding TP2 block")
+        retries = 0
         started = time.monotonic()
         deadline = started + self.timeout
         hard_deadline = started + 30.0
@@ -336,16 +361,44 @@ class TP2Transport:
                 break
             if not data:
                 continue
-            if (data[0] & 0xF0) == 0x90:
-                deadline = min(deadline + 1.0, hard_deadline)
+            opcode, sequence = classify_frame(data)
+            if opcode in (0x9, 0xB):
+                if len(data) != 1:
+                    raise TP2Error("Malformed TP2 acknowledgement")
+                if sequence == expected_sequence:
+                    if opcode == 0x9:
+                        time.sleep(NOT_READY_WAIT_SECONDS)
+                    return
+                requested = next((index for index, frame in enumerate(pending)
+                                  if (frame[0] & 0x0F) == sequence), None)
+                if requested is None:
+                    raise TP2Error(
+                        f"TP2 ACK requests sequence 0x{sequence:X} outside outstanding block")
+                if retries >= MAX_BLOCK_RETRIES:
+                    raise TP2Error("TP2 explicit retransmission limit exceeded")
+                # The prefix before the requested SN has been acknowledged and
+                # must never be replayed by a later, stale ACK.
+                pending = pending[requested:]
+                retries += 1
+                self.log(f"[TP2] explicit {'NotReady' if opcode == 0x9 else 'ACK'} "
+                         f"replay from SN 0x{sequence:X} ({retries}/{MAX_BLOCK_RETRIES})")
+                if opcode == 0x9:
+                    time.sleep(NOT_READY_WAIT_SECONDS)
+                for frame in pending:
+                    self.can_send(frame)
+                deadline = min(time.monotonic() + self.timeout, hard_deadline)
             elif data[0] == 0xA8:
                 self._peer_disconnected()
                 raise ConnectionError("Controller closed TP2 channel while waiting for ACK")
             elif data[0] == 0xA3:
                 self.can_send(CHANNEL_PARAMETERS_RESPONSE)
-            elif data[0] == expected:
-                return
             elif data[0] >> 4 in (0, 1, 2, 3):
+                # An old response retry does not acknowledge our new request.
+                if (data[0] >> 4 in (0, 1)
+                        and (data[0] & 0x0F) == ((self.rx_seq - 1) & 0x0F)
+                        and data == self.last_acked_rx_frame):
+                    self.send_ack(data[0] & 0x0F)
+                    continue
                 self.msgs.insert(0, (self.rx_addr, data))
                 return
         raise TP2Error(f"Did not receive expected ACK 0x{expected:02X}")
@@ -355,14 +408,33 @@ class TP2Transport:
         if len(payload) > 0xFFFF:
             raise ValueError("TP2 payload exceeds 65535 bytes")
         self.last_request_at = time.monotonic()
+        # Queued acknowledgements predate this message and cannot request a
+        # replay of its not-yet-sent frames.
+        queued_not_ready = any(d and (d[0] & 0xF0) == 0x90 for _, d in self.msgs)
         self.msgs = [(a, d) for a, d in self.msgs
-                     if d and (d[0] & 0xF0) != 0xB0]
+                     if d and (d[0] & 0xF0) not in (0x90, 0xB0)]
         frames, next_sequence = segment_message(
             payload, self.tx_seq, block_size=self.block_size, length_prefixed=True)
+        # Freeze complete ACK-bounded blocks before transmitting anything. At
+        # most 15 frames gives every outstanding frame a unique four-bit SN,
+        # distinct from the SN acknowledging the whole block.
+        blocks, pending = [], []
         for frame in frames:
-            self.can_send(frame)
+            pending.append(bytes(frame))
             if frame[0] >> 4 in (0, 1):
-                self.wait_for_ack(frame[0] & 0x0F)
+                if len(pending) > 15:
+                    raise TP2Error("Outstanding TP2 block exceeds unambiguous 15-frame window")
+                blocks.append(tuple(pending))
+                pending = []
+        if pending:
+            raise TP2Error("TP2 message has no final ACK boundary")
+        if queued_not_ready:
+            # Its sequence belongs to the old message, but honor its cooldown.
+            time.sleep(NOT_READY_WAIT_SECONDS)
+        for block in blocks:
+            for frame in block:
+                self.can_send(frame)
+            self.wait_for_ack(block[-1][0] & 0x0F, pending_frames=block)
         self.tx_seq = next_sequence
 
     def send_ack(self, received_sequence: Optional[int] = None):
