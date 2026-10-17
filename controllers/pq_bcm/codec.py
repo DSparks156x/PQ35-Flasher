@@ -90,6 +90,37 @@ TARGETS = MappingProxyType({
     "lin_b1_reply": ReadTarget(0x8034AC, 5, "LIN PID0xB1 receive cache, CPU-local 0x34AC..0x34B0; reply freshness and slave identity unproved"),
 })
 
+# Page FF (global 0x7FC000..0x7FFFFF, the S12X boot/vector page) is absent
+# from the firmware dump. The upload helper 7F42E0 treats encoded high byte
+# 0x80 as a CPU-local read, and CPU-local 0xC000..0xFFFF is the fixed alias of
+# page FF (CentElecRE comma_headlight_integration_plan.md §2.3 item 3). This is
+# the only window outside the named TARGETS, bounded to 64-byte uploads so each
+# needs one final 76 response under MAX_UPLOAD 0x43. Read-only; unproven live.
+PAGE_FF_TARGET = "page_ff"
+PAGE_FF_START = 0x80C000
+PAGE_FF_END = 0x810000  # exclusive
+PAGE_FF_GLOBAL_START = 0x7FC000
+PAGE_FF_SIZE = PAGE_FF_END - PAGE_FF_START
+PAGE_FF_CHUNK = 0x40
+
+
+def in_page_ff_window(address: int, length: int) -> bool:
+    return (type(address) is int and type(length) is int
+            and 1 <= length <= PAGE_FF_CHUNK
+            and PAGE_FF_START <= address and address + length <= PAGE_FF_END)
+
+
+def upload_target(address: int, length: int) -> str:
+    """Return the named target, or PAGE_FF_TARGET, covering exactly this read."""
+    for name, target in TARGETS.items():
+        if (address, length) == (target.encoded_address, target.length):
+            return name
+    if in_page_ff_window(address, length):
+        return PAGE_FF_TARGET
+    raise ProtocolError("Only exact reviewed named BCM read targets or 1..64-byte "
+                        "page FF alias reads (0x80C000..0x80FFFF) are enabled")
+
+
 DEFAULT_TARGETS = (
     "sensor", "frontparams", "light_hold", "light_threshold", "resident_prefix",
     "hold_eeprom", "frontparams_eeprom", "light_threshold_eeprom",
@@ -223,7 +254,13 @@ def _bytes(data) -> bytes:
 def setup_request(target: str) -> bytes:
     """Encode 35 + BE24 selector/address + 00 + BE24 length."""
     selected = _target(target)
-    return b"\x35" + selected.encoded_address.to_bytes(3, "big") + b"\x00" + selected.length.to_bytes(3, "big")
+    return window_setup_request(selected.encoded_address, selected.length)
+
+
+def window_setup_request(address: int, length: int) -> bytes:
+    """Encode 35 for a named target's exact range or a bounded page FF chunk."""
+    upload_target(address, length)
+    return b"\x35" + address.to_bytes(3, "big") + b"\x00" + length.to_bytes(3, "big")
 
 
 def transfer_request() -> bytes:
@@ -286,6 +323,12 @@ def parse_setup_response(reply, *, more: bool = False) -> None:
 def parse_transfer_response(target: str, reply, *, more: bool = False) -> bytes:
     """Accept 76 followed by exactly the selected raw byte count."""
     return _positive(reply, 0x76, _target(target).length, more)
+
+
+def parse_window_transfer_response(address: int, length: int, reply, *, more: bool = False) -> bytes:
+    """Accept 76 followed by exactly `length` bytes for a permitted window."""
+    upload_target(address, length)
+    return _positive(reply, 0x76, length, more)
 
 
 def parse_exit_response(reply, *, more: bool = False) -> None:

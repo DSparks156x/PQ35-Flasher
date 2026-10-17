@@ -16,6 +16,13 @@ whole-sector range that covers every changed byte including its Layer-1
 checksum word. If the ECU's previous image is uncertain, flash the full
 required range rather than guessing. Keep the flasher log and checksum result.
 
+The BCM page FF dump (`--module bcm --read-bcm-pageff`) is a read-only
+diagnostic. Page FF is the boot/vector page, global 0x7FC000..0x7FFFFF. The
+pq_bcm upload policy opens only named targets plus 1..0x40-byte reads inside
+encoded 0x80C000..0x80FFFF. Do not widen that window or the chunk size without
+new firmware evidence. It is still live CAN, so the hardware-owner rule
+applies.
+
 StopCommunication's ACK commits and soft-resets the ECU; it is not proof of
 application boot. Release the J2534 device, then obtain a fresh diagnostic or
 measuring-block read before claiming that the ECU is running. Do not infer

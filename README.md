@@ -244,6 +244,28 @@ There are also `--read-eps-motion`, `--read-eps-assist`, `--read-eps-supply`
 and `--read-eps-can-config`, which sample stock measuring blocks into a JSON
 file; see `python -m flasher.runner --module eps --help`.
 
+## BCM central electronics (`--module bcm`)
+
+**Read-only page FF dump.** Page FF (global `0x7FC000..0x7FFFFF`, 16 KiB) is
+the S12X boot/vector page, which is missing from application dumps. This reads
+it through the CPU-local alias the application's upload service exposes
+(encoded `0x80C000..0x80FFFF`), as 256 uploads of 0x40 bytes. It checks the
+identity (`8P0907063E`/`0575`), makes one seed/key attempt, and then sends
+only `35`/`36`/`37`. It never downloads, erases, writes or codes. Not yet run
+on hardware.
+
+```bash
+python -m flasher.runner --module bcm --read-bcm-pageff                     # into data/raw/readout/pq-bcm/
+python -m flasher.runner --module bcm --read-bcm-pageff --out pageFF.bin    # exact file name
+```
+
+A directory `--out` (the default is `data/raw/readout/pq-bcm`) gets
+`{part}_{sw}_pageFF_{UTC}.bin`. Next to it are a `.json` sidecar with the
+SHA-256, chunk count, timing and identity before and after, and a
+`.events.jsonl` request/CAN log. A failed read writes no image, only
+`*_failed.json` and `*_failed.events.jsonl`, and exits non-zero. On success it
+prints the absolute `.bin` path. Existing files are never overwritten.
+
 ## Adapters
 
 `--adapter` defaults to `j2534` (the registered DLL; override with `--dll`).

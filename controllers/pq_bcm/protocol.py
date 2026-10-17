@@ -7,6 +7,7 @@ injects the same transport used by other flasher controller readers. This contro
 import hashlib
 import json
 from pathlib import Path
+import sys
 import time
 
 from flasher.engine import PQMemoryReader, PQReadError, PQReadProfile, SecurityAccess, add32
@@ -19,7 +20,7 @@ from . import codec
 BCM_MODULE_ADDR = 0x20
 BCM_READ_KEY_ADD = 0xA41D
 MAX_UPLOAD = 0x43
-SUPPORTED_OPERATIONS = frozenset({"identify", "readout"})
+SUPPORTED_OPERATIONS = frozenset({"identify", "readout", "pageff"})
 
 
 def _target_for_range(address: int, length: int) -> str:
@@ -27,10 +28,10 @@ def _target_for_range(address: int, length: int) -> str:
         raise ValueError("BCM address and length must be integers")
     if not 1 <= length <= MAX_UPLOAD:
         raise ValueError("BCM upload length must be 1..67")
-    for name, target in codec.TARGETS.items():
-        if (address, length) == (target.encoded_address, target.length):
-            return name
-    raise ValueError("Only exact reviewed named BCM read targets are enabled")
+    try:
+        return codec.upload_target(address, length)
+    except codec.ProtocolError as error:
+        raise ValueError(str(error)) from None
 
 
 def validate_range(address: int, length: int) -> None:
@@ -85,6 +86,7 @@ class PQBCMReader(PQMemoryReader):
         self._read_session_verified = False
         self._upload_stage = "idle"
         self._upload_target = None
+        self._upload_window = None
         self._inflight_request = None
         # Coding writes (2E 0610/0611) are refused unless explicitly armed by
         # enable_coding_write(); reads never arm it.
@@ -107,8 +109,8 @@ class PQBCMReader(PQMemoryReader):
             return self._identity is not None and self.security_unlocked and not self.upload_active
         if request[:1] == b"\x35":
             return (self.privileged_active and self._read_session_verified
-                    and self._upload_stage == "setup" and self._upload_target is not None
-                    and request == codec.setup_request(self._upload_target))
+                    and self._upload_stage == "setup" and self._upload_window is not None
+                    and request == codec.window_setup_request(*self._upload_window))
         if request == codec.transfer_request():
             return self.upload_active and self._upload_stage == "transfer"
         if request == codec.exit_request():
@@ -167,7 +169,7 @@ class PQBCMReader(PQMemoryReader):
             codec.parse_setup_response(response)
             self._upload_stage = "transfer"
         elif request == codec.transfer_request():
-            codec.parse_transfer_response(self._upload_target, response)
+            codec.parse_window_transfer_response(*self._upload_window, response)
         elif request == codec.exit_request():
             codec.parse_exit_response(response)
         if self._part_reply is not None and self._version_reply is not None:
@@ -271,9 +273,10 @@ class PQBCMReader(PQMemoryReader):
         if not self.privileged_active or not self._read_session_verified:
             raise PQReadError("A verified BCM read session is required")
         self._upload_target = name
+        self._upload_window = (address, length)
         self._upload_stage = "setup"
         self.upload_active = True  # Shared leave() handles uncertain setup.
-        self._exchange(codec.setup_request(name))
+        self._exchange(codec.window_setup_request(address, length))
         data = self._exchange(codec.transfer_request())[1:]
         self.record({"event": "block_received", "address": address,
                      "length": len(data), "end_exclusive": address + len(data)})
@@ -281,6 +284,7 @@ class PQBCMReader(PQMemoryReader):
         self.upload_active = False
         self._upload_stage = "idle"
         self._upload_target = None
+        self._upload_window = None
         return data
 
     def read_target(self, name: str) -> bytes:
@@ -288,6 +292,34 @@ class PQBCMReader(PQMemoryReader):
             raise ValueError("Unknown BCM read target")
         selected = codec.TARGETS[name]
         return self.read_window(selected.encoded_address, selected.length)
+
+    def read_page_ff(self, progress_cb=None) -> bytes:
+        """Dump page FF (global 0x7FC000..0x7FFFFF) via its CPU-local alias.
+
+        Strictly read-only: identity, then the shared single-attempt
+        seed/key/session86 entry, then 256 sequential 35/36/37 uploads of 0x40
+        bytes across encoded 0x80C000..0x80FFFF. No download, erase, write or
+        coding request is permitted by _allowed(). progress_cb receives
+        (chunk_number, chunk_count, encoded_address) after each chunk.
+        """
+        if self._identity is None:
+            raise PQReadError("Identify the BCM before reading page FF")
+        if not self._read_session_verified:
+            self.enter()
+        count = codec.PAGE_FF_SIZE // codec.PAGE_FF_CHUNK
+        data = bytearray()
+        for index in range(count):
+            address = codec.PAGE_FF_START + index * codec.PAGE_FF_CHUNK
+            block = self.read_window(address, codec.PAGE_FF_CHUNK)
+            if len(block) != codec.PAGE_FF_CHUNK:
+                raise PQReadError(f"Page FF chunk at 0x{address:06X}: got {len(block)} bytes")
+            data.extend(block)
+            self.record({"event": "page_ff_chunk", "chunk": index + 1, "chunks": count,
+                         "encoded_address": address,
+                         "global_address": codec.PAGE_FF_GLOBAL_START + index * codec.PAGE_FF_CHUNK})
+            if progress_cb is not None:
+                progress_cb(index + 1, count, address)
+        return bytes(data)
 
     def probe(self, addresses, *, requested="auto"):
         raise PQReadError("BCM automatic address/service probing is disabled")
@@ -356,6 +388,14 @@ def apply_defaults(args):
 def validate_cli(parser, args):
     if args.module != BCM_MODULE_ADDR:
         parser.error("BCM application requires TP2 logical module0x20")
+    if getattr(args, "read_bcm_pageff", False):
+        if (args.input or args.recovery or args.start is not None or args.end is not None
+                or args.reference or args.readout_passes != 1 or args.readout_window != 0x10000
+                or getattr(args, "bcm_target", None) or getattr(args, "bcm_subsystems", False)
+                or getattr(args, "bcm_dtcs", False) or getattr(args, "bcm_measuring", None)
+                or getattr(args, "bcm_loader_config", None)):
+            parser.error("--read-bcm-pageff takes only adapter options and --out")
+        return
     flashing = bool(args.input) and not (args.ident_only or args.readout)
     if flashing:
         # Flash path validated in run_flash (needs a captured loader config).
@@ -467,6 +507,38 @@ def run_ident(args, runtime):
 
 def run_readout(args, runtime):
     return _capture(args, runtime, identify_only=False)
+
+
+def run_pageff(args, runtime):
+    """Read-only page FF dump; prints the saved .bin path on success."""
+    from flasher.readout import PQBCMPageFFReadout
+
+    if args.dry_run:
+        print(json.dumps({
+            "controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
+            "operation": "pageff", "status": "dry_run", "hardware_access": False,
+            "encoded_window": [codec.PAGE_FF_START, codec.PAGE_FF_END - 1],
+            "global_window": [codec.PAGE_FF_GLOBAL_START,
+                              codec.PAGE_FF_GLOBAL_START + codec.PAGE_FF_SIZE - 1],
+            "chunk": codec.PAGE_FF_CHUNK,
+            "chunks": codec.PAGE_FF_SIZE // codec.PAGE_FF_CHUNK,
+            "output": args.out, "firmware_writes": False,
+        }, indent=2, sort_keys=True))
+        return 0
+    readout = PQBCMPageFFReadout(open_device=lambda: runtime.open_adapter(args),
+                                 progress_cb=runtime.progress, verbose=args.verbose)
+    try:
+        report = readout.readout(args.out)
+    except KeyboardInterrupt:
+        print("Page FF read interrupted; see sidecar report", file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f"Page FF read failed: {error}", file=sys.stderr)
+        if readout.last_result.get("report_path"):
+            print("Report: " + readout.last_result["report_path"], file=sys.stderr)
+        return 1
+    print(report["path"])
+    return 0
 
 
 def run_flash(args, runtime):

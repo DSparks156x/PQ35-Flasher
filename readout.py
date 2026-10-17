@@ -421,3 +421,164 @@ class PQEPSEepromReadout(PQEPSReadout):
             raise failure
         self.progress_cb('READOUT_COMPLETE', 100, 'EPS EEPROM saved (1024 bytes)', 0, 0)
         return report
+
+
+def bcm_page_ff_filename(info, timestamp):
+    def safe(value):
+        return re.sub(r'[^A-Za-z0-9_-]+', '_', str(value)).strip('_')[:48] or 'unknown'
+    return (f"{safe(info.get('part_number'))}_{safe(info.get('sw_version'))}_pageFF_"
+            f"{timestamp.strftime('%Y%m%dT%H%M%SZ')}.bin")
+
+
+class PQBCMPageFFReadout:
+    """Read-only BCM page FF (global 0x7FC000..0x7FFFFF) dump with a JSON sidecar.
+
+    `output` ending in .bin names the image; anything else is a directory that
+    receives {part}_{sw}_pageFF_{UTC}.bin. The sidecar is the same stem + .json
+    and the request/response/CAN log is stem + .events.jsonl (a failed read
+    adds _failed to the stem). The image is written only after all 256 chunks
+    arrive, and nothing is ever overwritten.
+    """
+
+    def __init__(self, open_device=None, progress_cb=None, log_cb=None, verbose=False,
+                 channel=None, interface='socketcan'):
+        self.open_device = open_device or (
+            lambda: SocketCANDevice(channel=channel, interface=interface))
+        self.progress_cb = progress_cb or (lambda *args: None)
+        self.log_cb = log_cb or (lambda message: None)
+        self.verbose = verbose
+        self.abort_requested = False
+        self.device = self.transport = self.reader = None
+        self.last_result = {}
+        self.recovery_required = False  # Upload-only; never erases or writes.
+        self.destructive_started = False
+        self._cleaning = False
+
+    def close(self):
+        transport, device = self.transport, self.device
+        self.transport = self.device = None
+        try:
+            if transport is not None:
+                transport.disconnect()
+        finally:
+            if device is not None:
+                device.close()
+
+    def _cancel(self):
+        if self.abort_requested and not self._cleaning:
+            raise ReadoutCancelled('BCM page FF read cancelled')
+
+    def readout(self, output):
+        from .controllers.pq_bcm import codec
+        from .controllers.pq_bcm.protocol import BCM_MODULE_ADDR, CheckedCANDevice, PQBCMReader
+        from .vag_protocols.tp2 import TP2Transport
+
+        self._cancel()
+        started = datetime.now(timezone.utc)
+        output = Path(output)
+        if output.suffix.lower() == '.bin':
+            directory, fixed_name = output.parent, output.name
+        else:
+            directory, fixed_name = output, None
+        if fixed_name is not None and output.exists():
+            raise ProtocolError(f'Refusing to overwrite {output}')
+        directory.mkdir(parents=True, exist_ok=True)
+        chunks = codec.PAGE_FF_SIZE // codec.PAGE_FF_CHUNK
+        report = self.last_result = {
+            'controller': 'pq-bcm', 'module': BCM_MODULE_ADDR, 'readout_kind': 'page_ff',
+            'status': 'incomplete', 'started_utc': started.isoformat(),
+            'firmware_writes': False, 'recovery_required': False,
+            'encoded_start': codec.PAGE_FF_START, 'encoded_end_exclusive': codec.PAGE_FF_END,
+            'global_start': codec.PAGE_FF_GLOBAL_START,
+            'global_end_exclusive': codec.PAGE_FF_GLOBAL_START + codec.PAGE_FF_SIZE,
+            'size': codec.PAGE_FF_SIZE, 'chunk_size': codec.PAGE_FF_CHUNK,
+            'chunk_count': chunks, 'chunks_completed': 0,
+            'live_protocol_validated': False, 'cleanup_errors': [],
+        }
+        events = []
+
+        def record(event):
+            if event.get('event') == 'request':
+                self._cancel()
+            events.append({'monotonic': time.monotonic(), **event})
+            self.log_cb(json.dumps(event))
+
+        transfer_started = time.monotonic()
+
+        def progress(done, total, address):
+            report['chunks_completed'] = done
+            speed = done * codec.PAGE_FF_CHUNK / max(time.monotonic() - transfer_started, 0.001)
+            remaining = (total - done) * codec.PAGE_FF_CHUNK
+            self.progress_cb('BCM_PAGEFF', 100 * done / total, f'chunk {done}/{total}',
+                             speed, remaining / max(speed, 0.001))
+            self._cancel()
+
+        data = failure = None
+        try:
+            self.progress_cb('BCM_PAGEFF', 0, f'chunk 0/{chunks}; connecting', 0, 0)
+            self.device = CheckedCANDevice(self.open_device(), record)
+            self.transport = TP2Transport(self.device, module=BCM_MODULE_ADDR, bus=0,
+                                          timeout=2.0, debug=self.verbose)
+            self.reader = PQBCMReader(self.transport, record=record)
+            report['identification'] = info = self.reader.identification()
+            name = fixed_name or bcm_page_ff_filename(info, started)
+            if (directory / name).exists():
+                raise ProtocolError(f'Refusing to overwrite {directory / name}')
+            report['filename'] = name
+            self.reader.enter()
+            transfer_started = time.monotonic()
+            report['transfer_started_utc'] = datetime.now(timezone.utc).isoformat()
+            data = self.reader.read_page_ff(progress_cb=progress)
+            report['transfer_seconds'] = round(time.monotonic() - transfer_started, 3)
+            if len(data) != codec.PAGE_FF_SIZE:
+                raise ProtocolError(f'Expected {codec.PAGE_FF_SIZE} page FF bytes, got {len(data)}')
+        except BaseException as exc:
+            failure = exc
+            report.update(status='cancelled' if isinstance(exc, (ReadoutCancelled, KeyboardInterrupt))
+                          else 'failed', error=f'{type(exc).__name__}: {exc}')
+            record({'event': 'failure', 'error': str(exc)})
+        finally:
+            self._cleaning = True
+            if self.reader is not None:
+                try:
+                    report['cleanup_errors'].extend(self.reader.leave())
+                    if 'identification' in report:
+                        # Fresh post-session read: the BCM must still answer as the application.
+                        report['identification_after'] = self.reader.identification()
+                except Exception as exc:
+                    report['cleanup_errors'].append(str(exc))
+            try:
+                self.close()
+            except Exception as exc:
+                report['cleanup_errors'].append('device close: ' + str(exc))
+            self._cleaning = False
+        if failure is None and report['cleanup_errors']:
+            report['status'] = 'requires_attention'
+            failure = ProtocolError('; '.join(report['cleanup_errors']))
+        stem = Path(report.get('filename')
+                    or f"pageFF_{started.strftime('%Y%m%dT%H%M%SZ')}.bin").stem
+        if failure is None:
+            path = directory / report['filename']
+            with path.open('xb') as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            report.update(status='ok', path=str(path.resolve()),
+                          sha256=hashlib.sha256(data).hexdigest().upper())
+        else:
+            stem += '_failed'
+        report['finished_utc'] = datetime.now(timezone.utc).isoformat()
+        events_path = directory / f'{stem}.events.jsonl'
+        report_path = directory / f'{stem}.json'
+        report['events_file'] = events_path.name
+        report['report_path'] = str(report_path.resolve())
+        with events_path.open('x', encoding='utf-8') as handle:
+            for event in events:
+                handle.write(json.dumps(event, sort_keys=True) + '\n')
+        with report_path.open('x', encoding='utf-8') as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        if failure is not None:
+            raise failure
+        self.progress_cb('READOUT_COMPLETE', 100, f'chunk {chunks}/{chunks}; page FF saved', 0, 0)
+        return report

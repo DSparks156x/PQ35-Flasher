@@ -164,6 +164,8 @@ def build_parser(family=None):
                         help="Sample TT 3001 EPS raw supply proxy via KWP 21 02 while stationary")
     parser.add_argument("--read-eps-can-config", action="store_true",
                         help="Read TT 3001 secondary CAN configuration via KWP 21 08 while stationary")
+    parser.add_argument("--read-bcm-pageff", action="store_true",
+                        help="Read-only dump of BCM boot page FF (global 0x7FC000..0x7FFFFF, 16 KiB; BCM only)")
     parser.add_argument("--motion-samples", type=int, default=1,
                         help="Number of stationary EPS motion samples (default 1, maximum 200)")
     parser.add_argument("--motion-interval-ms", type=int, default=100,
@@ -223,6 +225,8 @@ def _operation(args):
         return "supply"
     if args.read_eps_can_config:
         return "can_config"
+    if args.read_bcm_pageff:
+        return "pageff"
     if args.readout:
         return "readout"
     return "flash"
@@ -284,8 +288,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if sum((args.ident_only, args.readout, args.read_eeprom, args.read_eps_faults,
             args.read_eps_motion, args.read_eps_assist, args.read_eps_supply,
-            args.read_eps_can_config)) > 1:
-        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply and CAN-config operations cannot be combined")
+            args.read_eps_can_config, args.read_bcm_pageff)) > 1:
+        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config and page FF operations cannot be combined")
     operation = _operation(args)
     if operation != "motion" and (args.motion_samples != 1 or args.motion_interval_ms != 100):
         parser.error("--motion-samples and --motion-interval-ms require --read-eps-motion")
