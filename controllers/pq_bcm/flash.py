@@ -257,40 +257,34 @@ def changed_sectors(image: bytes, reference: bytes, *, base: int = PFLASH_REGION
     return tuple(starts)
 
 
-def _contiguous_runs(starts) -> Tuple[Tuple[int, int], ...]:
-    runs = []
-    for start in sorted(set(starts)):
-        end = start + PFLASH_SECTOR - 1
-        if runs and start == runs[-1][1] + 1:
-            runs[-1] = (runs[-1][0], end)
-        else:
-            runs.append((start, end))
-    return tuple(runs)
-
-
 def plan_sectors(source, sector_starts, *, base: int = PFLASH_REGION[0],
                  regions=BCM_FLASH_REGIONS):
-    """Build flash segments for the selected P-Flash sectors from one image.
+    """Build one flash segment per selected 16 KiB P-Flash sector.
 
     `source` maps linearly from `base` (default 0x780000, the natural
-    full_flash_780000 layout). Contiguous selected sectors are coalesced into a
-    single erase/transfer/checksum cycle; non-contiguous ones become separate
-    segments flashed in one programming session. Every segment is validated and
-    checksummed by prepare_image (region, boot-block, alignment).
+    full_flash_780000 layout). Each sector becomes its OWN
+    download/erase/transfer/checksum cycle; the loader's RequestDownload
+    validator (FUN_00E1B9/E0BE) requires every download to exactly match one
+    16 KiB region-table entry, so contiguous sectors are NOT coalesced -- a
+    multi-sector download is rejected with NRC 0x42. The segments still flash in
+    a single programming session (34 has no state gate, so cycles repeat). Every
+    segment is validated and checksummed by prepare_image.
     """
     data = Path(source).read_bytes() if isinstance(source, (str, Path)) else bytes(source)
     if not sector_starts:
         raise ValueError("No sectors selected to flash")
     lo, hi = PFLASH_REGION
-    for start in sector_starts:
+    segments = []
+    for start in sorted(set(sector_starts)):
         if start % PFLASH_SECTOR or not (lo <= start <= hi):
             raise ValueError(f"0x{start:06X} is not a valid 16 KiB P-Flash sector start")
         if (start - base) < 0 or (start - base + PFLASH_SECTOR) > len(data):
             raise ValueError(
                 f"Sector 0x{start:06X} is not fully present in the image "
                 f"(base 0x{base:06X}, {len(data)} bytes)")
-    return [prepare_image(data, run_start, run_end, file_off=base, regions=regions)
-            for run_start, run_end in _contiguous_runs(sector_starts)]
+        segments.append(prepare_image(data, start, start + PFLASH_SECTOR - 1,
+                                      file_off=base, regions=regions))
+    return segments
 
 
 def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,

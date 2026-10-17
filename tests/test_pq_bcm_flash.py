@@ -117,11 +117,15 @@ class SectorPlanTests(unittest.TestCase):
         self.assertEqual(bcm_flash.changed_sectors(patched, self.image),
                          (0x7D0000, 0x7F4000))
 
-    def test_contiguous_sectors_coalesce_into_one_segment(self):
+    def test_contiguous_sectors_are_NOT_coalesced_one_segment_each(self):
+        # The loader's RequestDownload validator requires each download to match
+        # exactly one 16 KiB region-table entry; a multi-sector download is
+        # rejected NRC 0x42. So contiguous sectors must stay one segment each.
         segs = bcm_flash.plan_sectors(bytes(self.image), [0x7D0000, 0x7D4000, 0x7D8000])
-        self.assertEqual(len(segs), 1)
-        self.assertEqual((segs[0]["metadata"]["start_addr"], segs[0]["metadata"]["end_addr"]),
-                         (0x7D0000, 0x7DBFFF))
+        self.assertEqual([(s["metadata"]["start_addr"], s["metadata"]["end_addr"]) for s in segs],
+                         [(0x7D0000, 0x7D3FFF), (0x7D4000, 0x7D7FFF), (0x7D8000, 0x7DBFFF)])
+        for seg in segs:
+            self.assertEqual(seg["metadata"]["size"], 0x4000)
 
     def test_non_contiguous_sectors_are_separate_segments(self):
         segs = bcm_flash.plan_sectors(bytes(self.image), [0x7D0000, 0x7DC000, 0x7F4000])
@@ -130,6 +134,13 @@ class SectorPlanTests(unittest.TestCase):
         for seg in segs:
             self.assertEqual(seg["metadata"]["size"], 0x4000)
             self.assertIn("checksum", seg["metadata"])
+
+    def test_every_selected_sector_is_its_own_16k_download(self):
+        segs = bcm_flash.plan_sectors(bytes(self.image),
+                                      [0x7CC000, 0x7D0000, 0x7DC000, 0x7F4000])
+        self.assertEqual([s["metadata"]["start_addr"] for s in segs],
+                         [0x7CC000, 0x7D0000, 0x7DC000, 0x7F4000])
+        self.assertTrue(all(s["metadata"]["size"] == 0x4000 for s in segs))
 
     def test_boot_block_sector_cannot_be_planned(self):
         with self.assertRaises(ValueError):
