@@ -29,6 +29,7 @@ image checksum or a bad CRC32 descriptor table can still leave the application
 failing its own runtime integrity check (bootloop); keep every changed byte CRC
 consistent (see artifacts/comma_headlight_integration_plan.md).
 """
+import hashlib
 import json
 import struct
 from dataclasses import dataclass, field
@@ -67,12 +68,41 @@ BOOT_BLOCK = (0x7FC000, 0x7FFFFF)           # resident loader + vectors (protect
 PFLASH_SECTOR = 0x4000                      # 16 KiB erase/program sector
 FLASH_PHRASE = 0x08                         # loader programs 8-byte phrases
 
-# Flasher image contract: a full-span image, byte 0 = 0x780000, padded through
-# the boot block to 0x800000 -- same whole-span-with-padding convention as the
-# other families' binaries. Only the 31 P-Flash sectors below the boot block are
-# ever programmed; the boot-block tail is padding we never touch.
-BCM_IMAGE_BASE = 0x780000
-BCM_IMAGE_SIZE = 0x080000                   # 0x780000..0x7FFFFF inclusive
+# Flasher image contract: a full-span 1 MiB image, byte 0 = global 0x700000,
+# running through 0x7FFFFF. The 0x700000..0x77FFFF head and the 0x7A0000..0x7BFFFF
+# gap are all-0xFF, the application starts at 0x780000, and the boot-block tail
+# 0x7FC000..0x7FFFFF is padding we never touch. Only the 31 P-Flash sectors below
+# the boot block are ever programmed. (The old 512 KiB byte-0 = 0x780000 layout
+# is retired; such images must be re-exported in this 1 MiB 0x700000 layout.)
+BCM_IMAGE_BASE = 0x700000
+BCM_IMAGE_SIZE = 0x100000                   # 0x700000..0x7FFFFF inclusive
+
+# RAM-driver download stage (loader programming session download #1). Before any
+# application P-Flash page the loader requires one RAM-driver download into the
+# D-Flash/EEPROM staging window (region-table row 0, 0x003800..0x003FFB). The
+# driver is a SEPARATE .bin the operator supplies; its bytes are never embedded
+# here and never spliced into the application image. These constants pin the one
+# known-good driver so a supplied file is verified against them and a mismatch is
+# refused. The transfer is a RAM byte-copy, so neither the P-Flash 16 KiB sector
+# rule nor the 8-byte phrase rule applies (918 is not a multiple of 8). The
+# erase/checksum payloads use the ACTUAL data end 0x3B95, not the row capacity.
+DRIVER_LOAD_ADDR = 0x003800
+DRIVER_LEN = 918                            # 0x396, exact, NO padding
+DRIVER_END_INCLUSIVE = 0x003B95             # 0x3800 + 918 - 1
+DRIVER_SHA256 = "2DABA2AA4A2C9A84245137AFAB93A67576C65FE66404CC9B6D3B7AC8C86439AB"
+DRIVER_SUM16 = 0x5B2D                       # byte sum mod 65536, big-endian
+DRIVER_FLASH_REGION = (0x003800, 0x003FFB)  # loader row 0 (range check, not exact)
+
+# First-application-erase metadata: exactly six bytes appended to the 31 C4 of
+# download #2 only (the first application page after the RAM driver). See
+# make_bcm_flash_profile.erase_payload and bcm_first_erase_metadata_findings.md.
+FIRST_ERASE_METADATA_LEN = 6
+
+# DID 22 F184 (ISO 14229 applicationSoftwareFingerprint) returns the six NVM
+# bytes the loader stored on the last first-application erase. Re-sending the
+# module's own current fingerprint keeps the stored identity unchanged and avoids
+# inventing a format.
+APPLICATION_FINGERPRINT_DID = b"\xF1\x84"
 
 
 class BCMFlashNotConfigured(RuntimeError):
@@ -184,6 +214,23 @@ def _region_for(start: int, end: int, regions) -> Tuple[int, int]:
         f"region {['0x%06X..0x%06X' % r for r in regions]}")
 
 
+def require_full_span(data: bytes, what: str = "image") -> bytes:
+    """Reject anything but a whole 1 MiB, 0x700000-based BCM image.
+
+    Sector planning and change detection both map linearly from BCM_IMAGE_BASE,
+    so a mis-sized buffer would silently read the wrong bytes. Refuse early with
+    a message that points at the retired 512 KiB layout.
+    """
+    if len(data) != BCM_IMAGE_SIZE:
+        raise ValueError(
+            f"BCM {what} is {len(data)} bytes; it must be exactly "
+            f"{BCM_IMAGE_SIZE} bytes (1 MiB, global 0x{BCM_IMAGE_BASE:06X}.."
+            f"0x{BCM_IMAGE_BASE + BCM_IMAGE_SIZE - 1:06X}). An old 512 KiB "
+            f"0x780000-based image must be re-exported in the 1 MiB "
+            f"0x700000-based layout.")
+    return data
+
+
 def prepare_image(source, start_addr, end_addr, file_off=None, simulator_mode=False,
                   regions=BCM_FLASH_REGIONS):
     """Load a CPU-linear image slice and compute the loader checksum.
@@ -240,12 +287,16 @@ def sector_index(address: int) -> int:
     return (address - lo) // PFLASH_SECTOR
 
 
-def changed_sectors(image: bytes, reference: bytes, *, base: int = PFLASH_REGION[0]) -> Tuple[int, ...]:
+def changed_sectors(image: bytes, reference: bytes, *, base: int = BCM_IMAGE_BASE) -> Tuple[int, ...]:
     """P-Flash sector starts whose bytes differ between image and reference.
 
-    Both buffers map linearly from `base`. Only sectors fully present in both
-    are compared; this is how "flash only what the patch changed" is planned.
+    Both buffers map linearly from `base` (default BCM_IMAGE_BASE 0x700000, the
+    1 MiB full-span layout) and must each be a whole BCM_IMAGE_SIZE image. Only
+    the 31 application sectors are compared; this is how "flash only what the
+    patch changed" is planned.
     """
+    require_full_span(image, "image")
+    require_full_span(reference, "reference image")
     starts = []
     for start in pflash_sector_starts():
         off = start - base
@@ -257,20 +308,21 @@ def changed_sectors(image: bytes, reference: bytes, *, base: int = PFLASH_REGION
     return tuple(starts)
 
 
-def plan_sectors(source, sector_starts, *, base: int = PFLASH_REGION[0],
+def plan_sectors(source, sector_starts, *, base: int = BCM_IMAGE_BASE,
                  regions=BCM_FLASH_REGIONS):
     """Build one flash segment per selected 16 KiB P-Flash sector.
 
-    `source` maps linearly from `base` (default 0x780000, the natural
-    full_flash_780000 layout). Each sector becomes its OWN
-    download/erase/transfer/checksum cycle; the loader's RequestDownload
-    validator (FUN_00E1B9/E0BE) requires every download to exactly match one
-    16 KiB region-table entry, so contiguous sectors are NOT coalesced -- a
-    multi-sector download is rejected with NRC 0x42. The segments still flash in
-    a single programming session (34 has no state gate, so cycles repeat). Every
-    segment is validated and checksummed by prepare_image.
+    `source` maps linearly from `base` (default BCM_IMAGE_BASE 0x700000, the
+    1 MiB full-span layout) and must be a whole BCM_IMAGE_SIZE image. Each sector
+    becomes its OWN download/erase/transfer/checksum cycle; the loader's
+    RequestDownload validator (FUN_00E1B9/E0BE) requires every download to exactly
+    match one 16 KiB region-table entry, so contiguous sectors are NOT coalesced
+    -- a multi-sector download is rejected with NRC 0x42. The segments still flash
+    in a single programming session (34 has no state gate, so cycles repeat).
+    Every segment is validated and checksummed by prepare_image.
     """
     data = Path(source).read_bytes() if isinstance(source, (str, Path)) else bytes(source)
+    require_full_span(data, "image")
     if not sector_starts:
         raise ValueError("No sectors selected to flash")
     lo, hi = PFLASH_REGION
@@ -287,8 +339,111 @@ def plan_sectors(source, sector_starts, *, base: int = PFLASH_REGION[0],
     return segments
 
 
+def prepare_driver(source) -> dict:
+    """Load and verify the RAM-driver .bin, returning a prepared segment dict.
+
+    The driver is download #1 of every programming session. This is a RAM-stage
+    preparation path that deliberately BYPASSES the P-Flash 16 KiB sector rule and
+    the 8-byte phrase rule enforced by prepare_image (918 is not a multiple of 8,
+    and 0x3800 is not a 16 KiB boundary) -- the loader copies these bytes into RAM.
+    The supplied file is verified byte-for-byte against the known-good driver
+    (length + SHA-256); a mismatch is refused so a wrong or padded driver can never
+    be staged. The returned metadata is shaped like prepare_image's output; the
+    erase/checksum payloads use the data end 0x3B95, not the row-0 capacity 0x3FFB.
+    """
+    data = Path(source).read_bytes() if isinstance(source, (str, Path)) else bytes(source)
+    if len(data) != DRIVER_LEN:
+        raise BCMFlashNotConfigured(
+            f"RAM driver is {len(data)} bytes; the known-good BCM driver is exactly "
+            f"{DRIVER_LEN} bytes (0x{DRIVER_LEN:X}, no padding to 0x3FFB or a 16 KiB page)")
+    digest = hashlib.sha256(data).hexdigest().upper()
+    if digest != DRIVER_SHA256:
+        raise BCMFlashNotConfigured(
+            f"RAM driver SHA-256 {digest} does not match the known-good BCM driver "
+            f"{DRIVER_SHA256}; refusing to stage an unverified RAM driver")
+    checksum = sum16(data)
+    if checksum != DRIVER_SUM16:  # unreachable once the hash matches; defensive only
+        raise BCMFlashNotConfigured(
+            f"RAM driver sum16 0x{checksum:04X} does not match 0x{DRIVER_SUM16:04X}")
+    return {"region": data,
+            "metadata": {"start_addr": DRIVER_LOAD_ADDR, "end_addr": DRIVER_END_INCLUSIVE,
+                         "size": DRIVER_LEN, "controller": "pq-bcm",
+                         "flash_region": list(DRIVER_FLASH_REGION),
+                         "checksum": checksum, "checksum_kind": "sum16",
+                         "stage": "ram_driver"}}
+
+
+def validate_first_erase_metadata(value) -> bytes:
+    """Return exactly six non-zero metadata bytes, or raise.
+
+    The loader's first-application-erase branch (26B2 == 2) reads six bytes after
+    start/end and rejects the field (NRC 0x22) only when all six are zero. We also
+    refuse a missing value or a wrong length: the firmware reads six real bytes, so
+    guessing or padding is not a valid implementation.
+    """
+    if value is None:
+        raise BCMFlashNotConfigured(
+            "First-application-erase metadata is required but was not available "
+            "(read 22 F184 before the handoff, or pass an explicit 6-byte override)")
+    value = bytes(value)
+    if len(value) != FIRST_ERASE_METADATA_LEN:
+        raise BCMFlashNotConfigured(
+            f"First-application-erase metadata must be exactly {FIRST_ERASE_METADATA_LEN} "
+            f"bytes, got {len(value)}")
+    if not any(value):
+        raise BCMFlashNotConfigured(
+            "First-application-erase metadata is all-zero; the loader rejects this "
+            "with NRC 0x22. Refusing before any erase")
+    return value
+
+
+def read_application_fingerprint(kwp) -> Optional[bytes]:
+    """Read DID 22 F184 on the application channel; return 6 bytes or None.
+
+    Non-destructive. Returns None on any negative/short/malformed reply so the
+    caller can decide whether to refuse (the authoritative refusal happens in
+    validate_first_erase_metadata)."""
+    try:
+        response = bytes(kwp.request(b"\x22" + APPLICATION_FINGERPRINT_DID))
+    except Exception:
+        return None
+    if (len(response) == 3 + FIRST_ERASE_METADATA_LEN
+            and response[:1] == b"\x62" and response[1:3] == APPLICATION_FINGERPRINT_DID):
+        return response[3:]
+    return None
+
+
+def build_segment_plan(driver_segment: dict, application_segments) -> list:
+    """Assemble the full programming-session segment list: driver first, apps after.
+
+    The RAM driver is always download #1; the application pages are #2, #3, ...
+    The first application page (download #2) is marked so the BCM erase_payload
+    closure appends the six-byte first-erase metadata to its 31 C4 only. A
+    flash-first application list (no driver) is not a valid plan.
+    """
+    if not application_segments:
+        raise ValueError("No application segments to flash after the RAM driver")
+    if driver_segment.get("metadata", {}).get("stage") != "ram_driver":
+        raise ValueError("build_segment_plan requires a prepared RAM-driver segment first")
+    apps = []
+    for index, segment in enumerate(application_segments):
+        prepared = dict(segment)
+        metadata = dict(segment["metadata"])
+        if index == 0:
+            metadata["first_app_erase"] = True   # download #2 carries metadata
+        prepared["metadata"] = metadata
+        apps.append(prepared)
+    return [driver_segment] + apps
+
+
 def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,
-                           transport_factory, identify):
+                           transport_factory, identify, first_erase=None):
+    # Shared mutable holder for the six-byte first-application-erase metadata,
+    # kept inside the pq_bcm layer (never added to the controller-neutral engine).
+    # "override" is an explicit operator value; "captured" is filled by the BCM
+    # identify step from 22 F184; erase_payload reads whichever is available.
+    holder = first_erase if first_erase is not None else {}
+
     def validate_controller(info, metadata):
         part = str(info.get("software_part_number", info.get("part_number", ""))).upper()
         if not part.startswith("8P0907063E"):
@@ -314,7 +469,18 @@ def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,
 
     def erase_payload(start, end, metadata):
         # Loader 31 C4: start+end, each 24-bit (FUN_00E8AE), must equal the 34 range.
-        return _a3(start) + _a3(end)
+        payload = _a3(start) + _a3(end)
+        # ONLY the first application page (download #2, 26B2 == 2) carries six extra
+        # metadata bytes after start/end. The RAM driver (download #1) and later
+        # application pages keep the plain start+end form. The six bytes are the
+        # module's own re-sent fingerprint (or an explicit operator override); an
+        # all-zero/missing/short value is refused here before any erase.
+        if metadata.get("first_app_erase"):
+            meta = (metadata.get("first_erase_metadata")
+                    or holder.get("override")
+                    or holder.get("captured"))
+            payload += validate_first_erase_metadata(meta)
+        return payload
 
     def checksum_payload(start, end, metadata):
         if "checksum" not in metadata:
@@ -355,16 +521,40 @@ def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,
 class PQBCMFlasher(PQFlasher):
     def __init__(self, loader: Optional[LoaderConfig] = None, *, channel=None,
                  module=BCM_MODULE_ADDR, device=None, device_factory=None,
-                 progress_cb=None, log_cb=None, debug=False, interface="socketcan"):
+                 progress_cb=None, log_cb=None, debug=False, interface="socketcan",
+                 first_erase_override=None, first_erase_required=True):
         from ...socketcan_device import SocketCANDevice
         loader = loader or default_loader_config()
+        # Holder shared between the identify step (which captures 22 F184) and the
+        # profile's erase_payload closure (which appends the six bytes to the first
+        # application 31 C4). "require" makes a live flash refuse BEFORE any erase
+        # when neither an override nor a valid captured fingerprint is available.
+        holder = {"override": (validate_first_erase_metadata(first_erase_override)
+                               if first_erase_override is not None else None),
+                  "captured": None, "require": bool(first_erase_required)}
+        self._first_erase = holder
+
+        def bcm_identify(kwp, tp):
+            part = codec.parse_part_number_response(kwp.request(codec.part_number_request()))
+            info = {"part_number": part, "software_part_number": part, "connected": True}
+            fingerprint = read_application_fingerprint(kwp)
+            if fingerprint is not None:
+                holder["captured"] = fingerprint
+                info["application_fingerprint"] = fingerprint.hex().upper()
+            # Pre-flight refusal before any erase (including the RAM driver): if a
+            # first-application page will be flashed and no override was supplied,
+            # the 22 F184 read must have produced a valid six non-zero bytes.
+            if holder.get("require") and holder.get("override") is None:
+                validate_first_erase_metadata(holder.get("captured"))
+            return info
+
         profile = make_bcm_flash_profile(
             loader,
             kwp_factory=lambda tp, log, dbg: KWPClient(tp, log_fn=log, debug=dbg),
             device_factory=lambda ch: SocketCANDevice(channel=ch, interface=interface),
             transport_factory=lambda *a, **k: TP2Transport(*a, **k),
-            identify=lambda kwp, tp: {"part_number": codec.parse_part_number_response(
-                kwp.request(codec.part_number_request())), "connected": True},
+            identify=bcm_identify,
+            first_erase=holder,
         )
         super().__init__(profile, channel=channel, module=module, device=device,
                          device_factory=device_factory, progress_cb=progress_cb,
