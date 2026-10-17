@@ -419,7 +419,8 @@ def _capture(args, runtime, *, identify_only):
     if len(set(names)) != len(names) or any(name not in codec.TARGETS for name in names):
         raise ValueError("BCM targets must be distinct reviewed names")
     output = Path(args.out)
-    if output.exists():
+    # An existing empty directory (e.g. a caller's mkdtemp) is fine; never overwrite.
+    if output.exists() and not (output.is_dir() and not any(output.iterdir())):
         raise ValueError(f"Refusing to overwrite {output}")
     report = {
         "controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
@@ -436,7 +437,7 @@ def _capture(args, runtime, *, identify_only):
     if args.dry_run:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=True)
     events = []
     raw = {}
     device = transport = reader = None
@@ -500,9 +501,34 @@ def _capture(args, runtime, *, identify_only):
             130 if report["status"] == "capture_interrupted" else 1)
 
 
+def read_identification(transport, record=lambda event: None) -> dict:
+    """Shared-runner identity hook: 22 F187/F189 on an open TP2 channel.
+
+    This BCM has no KWP 1A (any 1A returns NRC 11), so the generic 1A 9B/9C
+    identify can never succeed here. Default session, no security, read-only.
+    """
+    info = PQBCMReader(transport, record=record).identification()
+    info["identity_service"] = "22 F187/F189"
+    return info
+
+
 def run_ident(args, runtime):
-    """Optional shared-runner identity hook; uses the BCM22 identity reader."""
-    return _capture(args, runtime, identify_only=True)
+    """Plain --ident-only prints the flat identity like other families and
+    writes nothing; the optional subsystem/DTC/measuring reads keep the
+    report-folder capture."""
+    if (getattr(args, "bcm_subsystems", False) or getattr(args, "bcm_dtcs", False)
+            or getattr(args, "bcm_measuring", None)):
+        return _capture(args, runtime, identify_only=True)
+    if args.dry_run:
+        print(json.dumps({"controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
+                          "operation": "identify", "status": "dry_run",
+                          "hardware_access": False,
+                          "requests": [codec.part_number_request().hex(),
+                                       codec.software_version_request().hex()]},
+                         indent=2, sort_keys=True))
+        return 0
+    from flasher.runner import identify_module
+    return identify_module(args, runtime)
 
 
 def run_readout(args, runtime):

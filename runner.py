@@ -247,25 +247,45 @@ def _configure_logging(args):
                         format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
 
+def read_identification(family, tp, *, debug=False, log_fn=None):
+    """Identify the module on an already-open TP2 channel; read-only.
+
+    A family protocol exposing read_identification(tp) owns its identity
+    services (the BCM has no KWP 1A and answers 22 F187/F189). Every other
+    family uses KWP 1A 9B/9C. The result is the flat identity dict, not yet
+    validated against the family.
+    """
+    protocol = family.protocol()
+    family_identify = getattr(protocol, "read_identification", None)
+    if family_identify is not None:
+        return family_identify(tp)
+    from flasher.engine import parse_vag_identification
+    from flasher.vag_protocols.kwp import KWPClient
+    kwp = KWPClient(tp, debug=debug, log_fn=log_fn)
+    result = parse_vag_identification(kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C))
+    decorate = getattr(protocol, "decorate_identification", None)
+    if decorate is not None:
+        result = decorate(result)
+    return result
+
+
 def run_ident(args, runtime):
     identify_hook = getattr(args.family.protocol(), "run_ident", None)
     if identify_hook is not None:
         return identify_hook(args, runtime)
-    from flasher.engine import parse_vag_identification
-    from flasher.vag_protocols.kwp import KWPClient
-    from flasher.vag_protocols.tp2 import TP20Transport
+    return identify_module(args, runtime)
+
+
+def identify_module(args, runtime):
+    """Open one channel, identify, validate the family, print the flat JSON."""
+    from flasher.vag_protocols.tp2 import TP2Transport
     device = tp = None
     try:
         device = runtime.open_adapter(args)
         protocol_log = logging.getLogger("ModuleIdentify").info
-        tp = TP20Transport(device, module=args.module, timeout=2.0,
-                           debug=args.verbose, log_fn=protocol_log)
-        kwp = KWPClient(tp, debug=args.verbose, log_fn=protocol_log)
-        result = parse_vag_identification(
-            kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C))
-        decorate = getattr(args.family.protocol(), "decorate_identification", None)
-        if decorate is not None:
-            result = decorate(result)
+        tp = TP2Transport(device, module=args.module, timeout=2.0,
+                          debug=args.verbose, log_fn=protocol_log)
+        result = read_identification(args.family, tp, debug=args.verbose, log_fn=protocol_log)
         args.family.validate_identification(result)
         result.update(connected=True, module=args.module,
                       controller_family=args.family.name)
