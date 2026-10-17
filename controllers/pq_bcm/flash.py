@@ -104,6 +104,14 @@ FIRST_ERASE_METADATA_LEN = 6
 # inventing a format.
 APPLICATION_FINGERPRINT_DID = b"\xF1\x84"
 
+# When the module's own 22 F184 fingerprint is blank (all-zero) and no explicit
+# override is given, the loader still demands six NON-ZERO bytes on the first
+# application erase (26B2==2 branch). Auto-fill a deterministic non-zero
+# programming fingerprint: BCD YYMMDD of the host date + a fixed flasher tag. The
+# loader does not parse these bytes (it only rejects all-zero); they become the
+# module's stored programming fingerprint, read back via 22 F184 / 22 F1A5.
+FLASHER_FINGERPRINT_TAG = b"\x50\x51\x46"   # "PQF": fixed non-zero flasher tag
+
 
 class BCMFlashNotConfigured(RuntimeError):
     """A live BCM flash was requested without the data needed to run it safely."""
@@ -413,6 +421,35 @@ def read_application_fingerprint(kwp) -> Optional[bytes]:
     return None
 
 
+def default_first_erase_fingerprint(today=None) -> bytes:
+    """A deterministic, non-zero first-erase fingerprint for a blank module.
+
+    Used when the module's 22 F184 is all-zero or unreadable and no override is
+    given. Six bytes: BCD YYMMDD of the host date + FLASHER_FINGERPRINT_TAG. The
+    loader does not interpret these (it only rejects all-zero); they become the
+    module's stored programming fingerprint, read back via 22 F184 / 22 F1A5.
+    """
+    from datetime import date
+    day = today or date.today()
+    fingerprint = bytes.fromhex(day.strftime("%y%m%d")) + FLASHER_FINGERPRINT_TAG
+    if len(fingerprint) != FIRST_ERASE_METADATA_LEN or not any(fingerprint):
+        raise BCMFlashNotConfigured("Generated first-erase fingerprint is invalid")
+    return fingerprint
+
+
+def resolve_first_erase_fingerprint(f184_value):
+    """Choose the six bytes to stage, with their source string.
+
+    Re-send the module's own 22 F184 when it carries a non-zero fingerprint (so a
+    previously-programmed identity is preserved); otherwise auto-fill a non-zero
+    value, because the loader rejects all-zero metadata with NRC 0x22.
+    """
+    if f184_value is not None and any(f184_value):
+        return bytes(f184_value), "module 22 F184"
+    source = "auto-filled (F184 blank)" if f184_value is not None else "auto-filled (F184 unreadable)"
+    return default_first_erase_fingerprint(), source
+
+
 def build_segment_plan(driver_segment: dict, application_segments) -> list:
     """Assemble the full programming-session segment list: driver first, apps after.
 
@@ -538,9 +575,8 @@ class PQBCMFlasher(PQFlasher):
             part = codec.parse_part_number_response(kwp.request(codec.part_number_request()))
             info = {"part_number": part, "software_part_number": part, "connected": True}
             fingerprint = read_application_fingerprint(kwp)
-            if fingerprint is not None:
-                holder["captured"] = fingerprint
-                info["application_fingerprint"] = fingerprint.hex().upper()
+            holder["captured"], info["first_erase_source"] = resolve_first_erase_fingerprint(fingerprint)
+            info["application_fingerprint"] = holder["captured"].hex().upper()
             # Pre-flight refusal before any erase (including the RAM driver): if a
             # first-application page will be flashed and no override was supplied,
             # the 22 F184 read must have produced a valid six non-zero bytes.

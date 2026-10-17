@@ -475,6 +475,34 @@ class FirstEraseMetadataTests(unittest.TestCase):
         self.assertIsNone(bcm_flash.read_application_fingerprint(FP(b"\x62\xF1\x84ABC")))
         self.assertIsNone(bcm_flash.read_application_fingerprint(FP(b"\x7F\x22\x31")))
 
+    def test_default_fingerprint_is_six_nonzero_bytes_date_plus_tag(self):
+        import datetime
+        fp = bcm_flash.default_first_erase_fingerprint(datetime.date(2026, 10, 17))
+        self.assertEqual(len(fp), 6)
+        self.assertTrue(any(fp))
+        # BCD YYMMDD + fixed tag.
+        self.assertEqual(fp, bytes.fromhex("261017") + bcm_flash.FLASHER_FINGERPRINT_TAG)
+        bcm_flash.validate_first_erase_metadata(fp)  # must be accepted
+        # Today's value is always valid/non-zero too.
+        self.assertTrue(any(bcm_flash.default_first_erase_fingerprint()))
+
+    def test_resolve_prefers_module_fingerprint_when_nonzero(self):
+        value, source = bcm_flash.resolve_first_erase_fingerprint(b"\x11\x22\x33\x44\x55\x66")
+        self.assertEqual(value, b"\x11\x22\x33\x44\x55\x66")
+        self.assertEqual(source, "module 22 F184")
+
+    def test_resolve_autofills_when_f184_blank_or_unreadable(self):
+        # All-zero F184 -> auto-fill a non-zero value (not a refusal).
+        value, source = bcm_flash.resolve_first_erase_fingerprint(bytes(6))
+        self.assertTrue(any(value))
+        self.assertIn("blank", source)
+        bcm_flash.validate_first_erase_metadata(value)
+        # Unreadable F184 (None) -> auto-fill too.
+        value, source = bcm_flash.resolve_first_erase_fingerprint(None)
+        self.assertTrue(any(value))
+        self.assertIn("unreadable", source)
+        bcm_flash.validate_first_erase_metadata(value)
+
 
 class DriverStagingOrchestrationTests(unittest.TestCase):
     """Changes 2/3/4 end-to-end through the engine with a fake KWP."""

@@ -870,7 +870,7 @@ def run_flash(args, runtime):
                       "size": driver_segment["metadata"]["size"],
                       "checksum": "0x%04X" % driver_segment["metadata"]["checksum"]}
     plan["first_erase_metadata"] = ("override" if first_erase_override is not None
-                                    else "from 22 F184 at flash time")
+                                    else "from 22 F184 (auto-filled if blank) at flash time")
     plan["segments"] = [{"download": index + 1,
                          "stage": s["metadata"].get("stage",
                                                     "application_first"
