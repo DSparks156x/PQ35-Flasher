@@ -436,6 +436,14 @@ def add_cli_arguments(parser):
     parser.add_argument("--bcm-changed-only", action="store_true",
                         help="With --input and --reference, flash only the P-Flash sectors that "
                              "differ from the reference (full-span stock image).")
+    parser.add_argument("--bcm-driver", metavar="PATH",
+                        help="RAM-driver .bin (download #1), required for any BCM flash. The "
+                             "loader needs one RAM-driver download before the first application "
+                             "page; the file is verified against the known-good 918-byte driver.")
+    parser.add_argument("--bcm-first-erase-meta", metavar="HEX",
+                        help="Override the six-byte first-application-erase metadata (12 hex "
+                             "chars). Bench use only; by default the module's own 22 F184 "
+                             "fingerprint is read and re-sent unchanged.")
 
 
 def apply_defaults(args):
@@ -486,11 +494,16 @@ def validate_cli(parser, args):
             parser.error("BCM flash needs either --bcm-sector/--bcm-changed-only or --start and --end")
         if args.readout_passes != 1 or args.readout_window != 0x10000:
             parser.error("BCM flash does not take readout range/pass options")
+        if not getattr(args, "bcm_driver", None):
+            parser.error("BCM flash requires --bcm-driver PATH: the loader stages one RAM-driver "
+                         "download (#1) before the first application page")
         return
     if not (args.ident_only or args.readout):
         parser.error("BCM supports identification, bounded readout, and flash")
     if args.ident_only and getattr(args, "bcm_target", None):
         parser.error("--bcm-target requires --readout")
+    if getattr(args, "bcm_driver", None) or getattr(args, "bcm_first_erase_meta", None):
+        parser.error("--bcm-driver/--bcm-first-erase-meta apply only to a BCM flash")
     if (args.input or args.recovery or args.start is not None or args.end is not None
             or args.reference or args.readout_passes != 1 or args.readout_window != 0x10000):
         parser.error("BCM accepts named targets rather than image/flash/range options")
@@ -827,23 +840,48 @@ def run_flash(args, runtime):
     }
     if not args.input:
         raise ValueError("BCM flash requires --input")
+    if not getattr(args, "bcm_driver", None):
+        raise ValueError("BCM flash requires --bcm-driver PATH (the RAM-driver download staged "
+                         "before the first application page)")
+
+    # Download #1: verify and prepare the separate RAM-driver file.
+    driver_segment = bcm_flash.prepare_driver(args.bcm_driver)
+
+    # Optional explicit six-byte first-erase metadata override (bench use).
+    first_erase_override = _parse_first_erase_meta(args, bcm_flash)
 
     sectors = _resolve_sectors(args, bcm_flash)
     if sectors is not None:
-        segments = bcm_flash.plan_sectors(args.input, sectors,
-                                          base=bcm_flash.BCM_IMAGE_BASE, regions=loader.regions)
+        app_segments = bcm_flash.plan_sectors(args.input, sectors,
+                                              base=bcm_flash.BCM_IMAGE_BASE, regions=loader.regions)
         plan["mode"] = "sectors"
         plan["sectors"] = [f"0x{s:06X}" for s in sectors]
-        plan["segments"] = [{"start": "0x%06X" % s["metadata"]["start_addr"],
-                             "end": "0x%06X" % s["metadata"]["end_addr"],
-                             "size": s["metadata"]["size"],
-                             "checksum": "0x%04X" % s["metadata"]["checksum"]} for s in segments]
     else:
-        prepared = bcm_flash.prepare_image(args.input, args.start, args.end,
-                                           regions=loader.regions)
-        segments = [prepared]
+        app_segments = [bcm_flash.prepare_image(args.input, args.start, args.end,
+                                                regions=loader.regions)]
         plan["mode"] = "range"
-        plan["metadata"] = prepared["metadata"]
+
+    # Download #1 is always the RAM driver; application pages are #2, #3, ... and
+    # the first application page carries the six-byte first-erase metadata.
+    segments = bcm_flash.build_segment_plan(driver_segment, app_segments)
+    plan["driver"] = {"stage": "ram_driver", "file": args.bcm_driver,
+                      "start": "0x%06X" % driver_segment["metadata"]["start_addr"],
+                      "end": "0x%06X" % driver_segment["metadata"]["end_addr"],
+                      "size": driver_segment["metadata"]["size"],
+                      "checksum": "0x%04X" % driver_segment["metadata"]["checksum"]}
+    plan["first_erase_metadata"] = ("override" if first_erase_override is not None
+                                    else "from 22 F184 at flash time")
+    plan["segments"] = [{"download": index + 1,
+                         "stage": s["metadata"].get("stage",
+                                                    "application_first"
+                                                    if s["metadata"].get("first_app_erase")
+                                                    else "application"),
+                         "start": "0x%06X" % s["metadata"]["start_addr"],
+                         "end": "0x%06X" % s["metadata"]["end_addr"],
+                         "size": s["metadata"]["size"],
+                         "carries_first_erase_metadata": bool(s["metadata"].get("first_app_erase")),
+                         "checksum": "0x%04X" % s["metadata"]["checksum"]}
+                        for index, s in enumerate(segments)]
 
     if args.dry_run:
         plan["status"] = "validated_dry_run"
@@ -866,10 +904,23 @@ def run_flash(args, runtime):
     flasher = bcm_flash.PQBCMFlasher(
         loader, device=device, module=args.module,
         device_factory=lambda: runtime.open_adapter(args),
-        progress_cb=runtime.progress, debug=args.verbose)
+        progress_cb=runtime.progress, debug=args.verbose,
+        first_erase_override=first_erase_override)
     result = flasher.flash_segments(segments, recovery=args.recovery)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _parse_first_erase_meta(args, bcm_flash):
+    """Parse and validate the optional --bcm-first-erase-meta override; None if unset."""
+    raw = getattr(args, "bcm_first_erase_meta", None)
+    if not raw:
+        return None
+    try:
+        value = bytes.fromhex(raw.strip().replace(" ", ""))
+    except ValueError as exc:
+        raise ValueError(f"--bcm-first-erase-meta is not valid hex: {exc}") from None
+    return bcm_flash.validate_first_erase_metadata(value)
 
 
 def _resolve_sectors(args, bcm_flash):
