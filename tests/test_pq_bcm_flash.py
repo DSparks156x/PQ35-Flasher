@@ -1,0 +1,142 @@
+"""Offline checks for the finalized BCM resident-loader flash profile.
+
+No CAN hardware is used. These lock the protocol parameters traced from the
+page-FF boot image (see CentElecRE/artifacts/bcm_pageff_loader_trace.md):
+loader security 27 01/02 with the Galois key, routines 31 C4 / 31 C5, the
+16-bit additive loader checksum, the flashable-region table, and the refusal of
+the self-protected boot block.
+"""
+
+import contextlib
+import importlib.util
+import io
+import struct
+from pathlib import Path
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+if "flasher" not in sys.modules:
+    try:
+        import flasher  # noqa: F401
+    except ImportError:
+        spec = importlib.util.spec_from_file_location(
+            "flasher", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["flasher"] = module
+        spec.loader.exec_module(module)
+
+from flasher.controllers.pq_bcm import flash as bcm_flash
+
+
+class LoaderKeyTests(unittest.TestCase):
+    def test_key_is_two_round_galois_of_seed(self):
+        # Reproduce the traced transform independently.
+        def ref(seed):
+            v = int.from_bytes(seed, "big")
+            for _ in range(2):
+                carry = v & 0x80000000
+                v = (v << 1) & 0xFFFFFFFF
+                if carry:
+                    v = (v | 1) ^ 0x1D825439
+            return v.to_bytes(4, "big")
+
+        for hexseed in ("12345678", "aabbccdd", "ffffffff", "0000a41d", "80000001"):
+            seed = bytes.fromhex(hexseed)
+            self.assertEqual(bcm_flash.bcm_loader_key(seed), ref(seed))
+
+    def test_zero_seed_means_already_unlocked(self):
+        self.assertIsNone(bcm_flash.bcm_loader_key(bytes(4)))
+
+    def test_seed_must_be_four_bytes(self):
+        with self.assertRaises(RuntimeError):
+            bcm_flash.bcm_loader_key(b"\x01\x02\x03")
+
+
+class ChecksumTests(unittest.TestCase):
+    def test_sum16_is_additive_byte_sum_mod_65536(self):
+        self.assertEqual(bcm_flash.sum16(bytes(range(256))), 0x7F80)
+        self.assertEqual(bcm_flash.sum16(b"\xFF" * 0x4000), (0xFF * 0x4000) & 0xFFFF)
+
+
+class PrepareImageTests(unittest.TestCase):
+    def test_whole_pflash_sector_ok_and_computes_checksum(self):
+        img = bytes((i * 3) & 0xFF for i in range(0x4000))
+        prepared = bcm_flash.prepare_image(img, 0x7D0000, 0x7D3FFF, file_off=0x7D0000)
+        meta = prepared["metadata"]
+        self.assertEqual(meta["size"], 0x4000)
+        self.assertEqual(meta["flash_region"], [0x780000, 0x7FBFFF])
+        self.assertEqual(meta["checksum_kind"], "sum16")
+        self.assertEqual(meta["checksum"], sum(img) & 0xFFFF)
+        self.assertEqual(prepared["region"], img)
+
+    def test_boot_block_is_always_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            bcm_flash.prepare_image(bytes(0x4000), 0x7FC000, 0x7FFFFF, file_off=0x7FC000)
+        self.assertIn("boot block", str(cm.exception).lower())
+
+    def test_range_touching_boot_block_tail_refused(self):
+        with self.assertRaises(ValueError):
+            bcm_flash.prepare_image(bytes(0x8000), 0x7F8000, 0x7FFFFF, file_off=0x7F8000)
+
+    def test_outside_any_region_refused(self):
+        with self.assertRaises(ValueError):
+            bcm_flash.prepare_image(bytes(0x4000), 0x700000, 0x703FFF, file_off=0x700000)
+
+    def test_pflash_must_be_sector_aligned(self):
+        with self.assertRaises(ValueError):
+            bcm_flash.prepare_image(bytes(0x100), 0x7D0000, 0x7D00FF, file_off=0x7D0000)
+        with self.assertRaises(ValueError):
+            bcm_flash.prepare_image(bytes(0x4000), 0x7D0010, 0x7D400F, file_off=0x7D0010)
+
+    def test_length_must_be_whole_phrases(self):
+        # Inside the EEPROM region (no sector rule) but not an 8-byte multiple.
+        with self.assertRaises(ValueError):
+            bcm_flash.prepare_image(bytes(5), 0x13F070, 0x13F074, file_off=0x13F070)
+
+    def test_requires_explicit_range(self):
+        with self.assertRaises(bcm_flash.BCMFlashNotConfigured):
+            bcm_flash.prepare_image(bytes(0x4000), None, None)
+
+
+class ProfileWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.loader = bcm_flash.default_loader_config()
+        self.profile = bcm_flash.make_bcm_flash_profile(
+            self.loader,
+            kwp_factory=lambda *a, **k: None,
+            device_factory=lambda ch: None,
+            transport_factory=lambda *a, **k: None,
+            identify=lambda kwp, tp: {},
+        )
+
+    def test_security_is_loader_27_01_02_with_galois_key(self):
+        sec = self.profile.programming_security
+        self.assertEqual((sec.request_seed, sec.send_key), (0x01, 0x02))
+        self.assertIs(sec.derive_key, bcm_flash.bcm_loader_key)
+
+    def test_sessions_match_app_handoff(self):
+        self.assertEqual(self.profile.initial_session, 0x89)
+        self.assertEqual(self.profile.programming_session, 0x85)
+
+    def test_routines_are_c4_c5(self):
+        self.assertEqual(self.profile.erase_routine, 0xC4)
+        self.assertEqual(self.profile.checksum_routine, 0xC5)
+
+    def test_erase_payload_is_start_end_24bit(self):
+        self.assertEqual(self.profile.erase_payload(0x7D0000, 0x7D3FFF, {}),
+                         bytes.fromhex("7D00007D3FFF"))
+
+    def test_checksum_payload_is_start_end_sum16(self):
+        payload = self.profile.checksum_payload(0x7D0000, 0x7D3FFF, {"checksum": 0x1234})
+        self.assertEqual(payload, bytes.fromhex("7D00007D3FFF") + struct.pack(">H", 0x1234))
+
+    def test_default_flash_range_is_application_pflash(self):
+        self.assertEqual((self.loader.flash_start, self.loader.flash_end),
+                         (0x780000, 0x7FBFFF))
+        self.assertIn((0x780000, 0x7FBFFF), self.loader.regions)
+        self.assertNotIn(bcm_flash.BOOT_BLOCK, self.loader.regions)
+
+
+if __name__ == "__main__":
+    unittest.main()

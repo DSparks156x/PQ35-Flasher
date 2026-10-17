@@ -568,44 +568,44 @@ def run_pageff(args, runtime):
 
 
 def run_flash(args, runtime):
-    """Scaffold BCM flash. Dry-run validates the image slice and prints the plan;
-    a live flash requires a captured resident-loader config (--bcm-loader-config)
-    and explicit YES, because the BCM has no anti-brick net and the loader's
-    erase/checksum/security are not known from our dump."""
+    """BCM resident-loader flash. Dry-run validates the image slice (region,
+    boot-block, sector/phrase alignment, loader checksum) and prints the plan; a
+    live flash needs explicit YES. The loader protocol is now traced from the
+    page-FF boot image (see artifacts/bcm_pageff_loader_trace.md), so a captured
+    --bcm-loader-config is optional -- supply one only to override a field from a
+    bench capture. The boot block is self-protected, but a wrong image CRC32
+    table can still bootloop the application."""
     from . import flash as bcm_flash
+
+    loader = (bcm_flash.LoaderConfig.from_file(args.bcm_loader_config)
+              if getattr(args, "bcm_loader_config", None)
+              else bcm_flash.default_loader_config())
 
     plan = {
         "controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
         "operation": "flash", "input": args.input,
         "start": args.start, "end": args.end,
-        "no_anti_brick": True,
-        "required_capture": bcm_flash.REQUIRED_CAPTURE,
+        "loader_config": "captured" if getattr(args, "bcm_loader_config", None) else "traced_default",
+        "flash_range": [loader.flash_start, loader.flash_end],
+        "boot_block_protected": list(bcm_flash.BOOT_BLOCK),
+        "confirm_on_bench": bcm_flash.REQUIRED_CAPTURE,
     }
     if not args.input:
         raise ValueError("BCM flash requires --input")
-    prepared = bcm_flash.prepare_image(args.input, args.start, args.end)
+    prepared = bcm_flash.prepare_image(args.input, args.start, args.end,
+                                       regions=loader.regions)
     plan["metadata"] = prepared["metadata"]
 
     if args.dry_run:
         plan["status"] = "validated_dry_run"
         print(json.dumps(plan, indent=2, sort_keys=True))
-        print("No CAN traffic sent. Supply --bcm-loader-config and --yes for a live flash.")
+        print("No CAN traffic sent. Re-run with --yes for a live flash.")
         return 0
 
-    if not getattr(args, "bcm_loader_config", None):
-        plan["status"] = "refused_no_loader_config"
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        raise bcm_flash.BCMFlashNotConfigured(
-            "Live BCM flash refused: no resident-loader config. Capture a real BCM "
-            "programming session and supply --bcm-loader-config. Needed: "
-            + "; ".join(bcm_flash.REQUIRED_CAPTURE))
-
-    loader = bcm_flash.LoaderConfig.from_file(args.bcm_loader_config)
-    print(json.dumps(dict(plan, status="loader_config_loaded",
-                          flash_range=[loader.flash_start, loader.flash_end]),
-                     indent=2, sort_keys=True))
-    print("WARNING: the PQ BCM has NO anti-brick recovery. A wrong checksum or "
-          "routine can require BSL recovery. You are the sole hardware owner.")
+    print(json.dumps(dict(plan, status="ready"), indent=2, sort_keys=True))
+    print("WARNING: the PQ BCM's only anti-brick protection is boot-block "
+          "self-protection. A wrong image CRC32 table can still leave the "
+          "application bootlooping. You are the sole hardware owner.")
     if not args.yes and input("Type YES to erase and flash the BCM: ") != "YES":
         print("Cancelled before adapter access.")
         return 1
