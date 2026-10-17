@@ -349,6 +349,28 @@ class PQBCMReader(PQMemoryReader):
                 progress_cb(index + 1, count, offset)
         return bytes(data)
 
+    def read_programming_preconditions(self) -> dict:
+        """Read the four CPU-local RAM gates the BCM's 10 85 handler checks.
+
+        Firmware ground truth (app precondition function FUN_79a4fa): 10 85 is
+        refused with NRC 0x22 conditionsNotCorrect unless all four gates hold.
+        Strictly read-only: identity, then the shared single-attempt
+        seed/key/session86 entry, then four 35/36/37 uploads of the four exact
+        named targets (prog_voltage/prog_attempt_counter/prog_flag_2d09/
+        prog_flag_0068). No download, erase, write, routine or coding request is
+        permitted by _allowed(). Returns the decoded gate dict so a flash can
+        tell the user which precondition is blocking instead of a bare 0x22.
+        """
+        if self._identity is None:
+            raise PQReadError("Identify the BCM before reading programming preconditions")
+        if not self._read_session_verified:
+            self.enter()
+        voltage = self.read_target("prog_voltage")
+        counter = self.read_target("prog_attempt_counter")
+        flag2d09 = self.read_target("prog_flag_2d09")
+        flag0068 = self.read_target("prog_flag_0068")
+        return codec.decode_programming_preconditions(voltage, counter, flag2d09, flag0068)
+
     def probe(self, addresses, *, requested="auto"):
         raise PQReadError("BCM automatic address/service probing is disabled")
 
@@ -417,6 +439,9 @@ def add_cli_arguments(parser):
 
 
 def apply_defaults(args):
+    if getattr(args, "bcm_preconditions", False):
+        # Read-only gate check; prints JSON and writes no capture folder.
+        return
     if getattr(args, "bcm_backup", False):
         args.out = args.out or time.strftime("data/raw/backup/pq-bcm/%Y%m%dT%H%M%S")
         return
@@ -440,6 +465,15 @@ def validate_cli(parser, args):
                 or getattr(args, "bcm_dtcs", False) or getattr(args, "bcm_measuring", None)
                 or getattr(args, "bcm_loader_config", None)):
             parser.error("--read-bcm-pageff takes only adapter options and --out")
+        return
+    if getattr(args, "bcm_preconditions", False):
+        if (args.input or args.recovery or args.start is not None or args.end is not None
+                or args.reference or args.readout_passes != 1 or args.readout_window != 0x10000
+                or getattr(args, "bcm_target", None) or getattr(args, "bcm_sector", None)
+                or getattr(args, "bcm_changed_only", False) or getattr(args, "bcm_subsystems", False)
+                or getattr(args, "bcm_dtcs", False) or getattr(args, "bcm_measuring", None)
+                or getattr(args, "bcm_loader_config", None)):
+            parser.error("--bcm-preconditions takes only adapter options and --out")
         return
     flashing = bool(args.input) and not (args.ident_only or args.readout)
     if flashing:
@@ -714,6 +748,60 @@ def run_pageff(args, runtime):
     return 0
 
 
+def run_preconditions(args, runtime):
+    """Read-only programming-precondition check (BCM only).
+
+    Reads the four CPU-local RAM gates the BCM's 10 85 handler (app function
+    FUN_79a4fa) checks before accepting the programming session, decodes them,
+    and prints the result as JSON. A flash that hits NRC 0x22
+    conditionsNotCorrect can run this first to learn which gate (supply
+    voltage, attempt counter, status flags) is blocking. No download, erase,
+    write, routine or coding request is issued. Returns 0 iff all gates pass.
+    """
+    names = ("prog_voltage", "prog_attempt_counter", "prog_flag_2d09", "prog_flag_0068")
+    if args.dry_run:
+        print(json.dumps({
+            "controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
+            "operation": "preconditions", "status": "dry_run",
+            "hardware_access": False, "firmware_writes": False,
+            "targets": {name: {"encoded_address": codec.TARGETS[name].encoded_address,
+                               "length": codec.TARGETS[name].length,
+                               "interpretation": codec.TARGETS[name].interpretation}
+                        for name in names},
+        }, indent=2, sort_keys=True))
+        return 0
+    device = transport = reader = None
+    result = None
+    try:
+        device = CheckedCANDevice(runtime.open_adapter(args))
+        transport = TP2Transport(device, module=BCM_MODULE_ADDR, bus=0,
+                                 timeout=2.0, debug=args.verbose)
+        reader = PQBCMReader(transport)
+        reader.identification()
+        result = reader.read_programming_preconditions()
+    except KeyboardInterrupt:
+        print("Precondition read interrupted", file=sys.stderr)
+    except Exception as error:
+        print(f"Precondition read failed: {error}", file=sys.stderr)
+    finally:
+        if reader is not None:
+            reader.leave()
+        if transport is not None:
+            try:
+                transport.disconnect()
+            except Exception:
+                pass
+        if device is not None:
+            try:
+                device.close()
+            except Exception:
+                pass
+    if result is None:
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["all_ok"] else 1
+
+
 def run_flash(args, runtime):
     """BCM resident-loader flash. Dry-run validates the image slice (region,
     boot-block, sector/phrase alignment, loader checksum) and prints the plan; a
@@ -767,6 +855,10 @@ def run_flash(args, runtime):
     print("WARNING: the PQ BCM's only anti-brick protection is boot-block "
           "self-protection. A wrong image CRC32 table can still leave the "
           "application bootlooping. You are the sole hardware owner.")
+    print("If the flash is refused with 'conditions not met' (NRC 0x22), the "
+          "module's 10 85 programming preconditions were not satisfied; re-run "
+          "with --bcm-preconditions to check supply voltage, ignition and the "
+          "attempt counter before trying again.")
     if not args.yes and input("Type YES to erase and flash the BCM: ") != "YES":
         print("Cancelled before adapter access.")
         return 1

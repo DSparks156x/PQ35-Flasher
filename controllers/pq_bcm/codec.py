@@ -88,6 +88,10 @@ TARGETS = MappingProxyType({
     "receive_state": ReadTarget(0x802DC8, 1, "CPU-local 0x2DC8 receive-group state; native CAN0x621/0x3E3 copying requires mask0x0C nonzero"),
     "lin_f0_commands": ReadTarget(0x80349F, 5, "LIN PID0xF0 command payload cache, CPU-local 0x349F..0x34A3; active schedule depends on coding, recipient identity unproved"),
     "lin_b1_reply": ReadTarget(0x8034AC, 5, "LIN PID0xB1 receive cache, CPU-local 0x34AC..0x34B0; reply freshness and slave identity unproved"),
+    "prog_voltage": ReadTarget(0x801FF6, 2, "Programming precondition: supply voltage gate (CPU-local 0x1FF6); 10 85 needs value > 0x2EE0, ~12.0 V if millivolts (scaling inferred)"),
+    "prog_attempt_counter": ReadTarget(0x801BFD, 1, "Programming precondition: attempt/fault counter (CPU-local 0x1BFD); 10 85 needs value < 4"),
+    "prog_flag_2d09": ReadTarget(0x802D09, 1, "Programming precondition status flag (CPU-local 0x2D09); 10 85 needs bit7 clear"),
+    "prog_flag_0068": ReadTarget(0x800068, 1, "Programming precondition status flag (CPU-local 0x0068); 10 85 needs bit1 clear"),
 })
 
 # Page FF (global 0x7FC000..0x7FFFFF, the S12X boot/vector page) is absent
@@ -415,6 +419,58 @@ def decode_sensor_data(data) -> dict:
         "light_dark_flag": (raw[1] >> 5) & 1,
         "automatic_light_request": raw[1] & 1,
         "group15_rain": (raw[3] >> 3) & 7,
+    }
+
+
+def decode_programming_preconditions(voltage: bytes, counter: bytes,
+                                     flag2d09: bytes, flag0068: bytes) -> dict:
+    """Decode the four CPU-local RAM gates the BCM's 10 85 handler checks.
+
+    Firmware ground truth (app precondition function FUN_79a4fa): the module
+    refuses the programming handoff (10 85 -> NRC 0x22 conditionsNotCorrect)
+    unless ALL FOUR gates hold. Inputs are the raw bytes of the four named
+    reads (prog_voltage 2 bytes, the three flag/counter targets 1 byte each).
+    The millivolt->volt scaling of the supply gate is INFERRED, not confirmed
+    on hardware; `supply_volts` and `scaling_note` carry that caveat.
+    """
+    raw_v = _bytes(voltage)
+    raw_c = _bytes(counter)
+    raw_2d09 = _bytes(flag2d09)
+    raw_0068 = _bytes(flag0068)
+    if len(raw_v) != 2:
+        raise ProtocolError("Supply voltage must be exactly two raw bytes")
+    if len(raw_c) != 1 or len(raw_2d09) != 1 or len(raw_0068) != 1:
+        raise ProtocolError("Counter and status flags must each be one raw byte")
+    supply_raw = int.from_bytes(raw_v, "big")
+    attempt_counter = raw_c[0]
+    flag_2d09 = raw_2d09[0]
+    flag_0068 = raw_0068[0]
+    supply_ok = supply_raw > 0x2EE0
+    counter_ok = attempt_counter < 4
+    flag_2d09_ok = (flag_2d09 & 0x80) == 0
+    flag_0068_ok = (flag_0068 & 0x02) == 0
+    blocking = []
+    if not supply_ok:
+        blocking.append(f"supply {supply_raw / 1000:.2f} V (needs >= 12.00 V)")
+    if not counter_ok:
+        blocking.append(f"attempt counter {attempt_counter} (needs < 4; cycle ignition)")
+    if not flag_2d09_ok:
+        blocking.append("status flag 0x2D09 bit7 set")
+    if not flag_0068_ok:
+        blocking.append("status flag 0x0068 bit1 set")
+    return {
+        "supply_raw": supply_raw,
+        "supply_volts": round(supply_raw / 1000, 3),
+        "supply_ok": supply_ok,
+        "attempt_counter": attempt_counter,
+        "counter_ok": counter_ok,
+        "flag_2d09": flag_2d09,
+        "flag_2d09_ok": flag_2d09_ok,
+        "flag_0068": flag_0068,
+        "flag_0068_ok": flag_0068_ok,
+        "all_ok": supply_ok and counter_ok and flag_2d09_ok and flag_0068_ok,
+        "blocking": blocking,
+        "scaling_note": "voltage scaling (mV) is inferred, not hardware-confirmed",
     }
 
 

@@ -40,7 +40,7 @@ FAMILIES = (
         module_aliases=("bcm", "cent-elec", "pq-bcm"),
         protocol_module="flasher.controllers.pq_bcm.protocol",
         patches_module="",  # No anti-brick patch module; boot-block self-protection only.
-        operations=frozenset({"identify", "readout", "pageff", "backup", "flash"}),
+        operations=frozenset({"identify", "readout", "pageff", "backup", "preconditions", "flash"}),
         part_prefixes=("8P0907063E",),
     ),
     ControllerFamily(
