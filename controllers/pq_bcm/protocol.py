@@ -378,16 +378,33 @@ def add_cli_arguments(parser):
     parser.add_argument("--bcm-measuring", action="append", type=lambda v: int(v, 0),
                         help="Also read measuring group N (21 NN); repeat for several")
     parser.add_argument("--bcm-loader-config",
-                        help="JSON of captured resident-loader params required for a live BCM flash")
+                        help="JSON of captured resident-loader params; optional, overrides traced defaults")
+    parser.add_argument("--bcm-sector", action="append", metavar="SECTOR",
+                        help="Flash one 16 KiB P-Flash sector: a hex start (0x7D0000) or an "
+                             "index 0..30 (0 = 0x780000). Repeat for several; needs --input. "
+                             "Non-contiguous sectors flash in one session.")
+    parser.add_argument("--bcm-changed-only", action="store_true",
+                        help="With --input and --reference, flash only the P-Flash sectors that "
+                             "differ from the reference (full-span stock image).")
 
 
 def apply_defaults(args):
+    if getattr(args, "bcm_backup", False):
+        args.out = args.out or time.strftime("data/raw/backup/pq-bcm/%Y%m%dT%H%M%S")
+        return
     args.out = args.out or "data/raw/readout/pq-bcm"
 
 
 def validate_cli(parser, args):
     if args.module != BCM_MODULE_ADDR:
         parser.error("BCM application requires TP2 logical module0x20")
+    if getattr(args, "bcm_backup", False):
+        if (args.input or args.recovery or args.start is not None or args.end is not None
+                or args.reference or getattr(args, "bcm_target", None)
+                or getattr(args, "bcm_sector", None) or getattr(args, "bcm_changed_only", False)
+                or args.readout_passes != 1 or args.readout_window != 0x10000):
+            parser.error("--bcm-backup takes only adapter options and --out")
+        return
     if getattr(args, "read_bcm_pageff", False):
         if (args.input or args.recovery or args.start is not None or args.end is not None
                 or args.reference or args.readout_passes != 1 or args.readout_window != 0x10000
@@ -398,12 +415,18 @@ def validate_cli(parser, args):
         return
     flashing = bool(args.input) and not (args.ident_only or args.readout)
     if flashing:
-        # Flash path validated in run_flash (needs a captured loader config).
-        if args.reference or args.readout_passes != 1 or args.readout_window != 0x10000:
+        sector_mode = bool(getattr(args, "bcm_sector", None) or getattr(args, "bcm_changed_only", False))
+        if sector_mode and (args.start is not None or args.end is not None):
+            parser.error("Use either --bcm-sector/--bcm-changed-only or --start/--end, not both")
+        if getattr(args, "bcm_changed_only", False) and not args.reference:
+            parser.error("--bcm-changed-only needs --reference (the stock full-span image)")
+        if not sector_mode and (args.start is None or args.end is None):
+            parser.error("BCM flash needs either --bcm-sector/--bcm-changed-only or --start and --end")
+        if args.readout_passes != 1 or args.readout_window != 0x10000:
             parser.error("BCM flash does not take readout range/pass options")
         return
     if not (args.ident_only or args.readout):
-        parser.error("BCM supports identification, bounded readout, and (scaffold) flash")
+        parser.error("BCM supports identification, bounded readout, and flash")
     if args.ident_only and getattr(args, "bcm_target", None):
         parser.error("--bcm-target requires --readout")
     if (args.input or args.recovery or args.start is not None or args.end is not None
@@ -535,6 +558,63 @@ def run_readout(args, runtime):
     return _capture(args, runtime, identify_only=False)
 
 
+def run_backup(args, runtime):
+    """Read-only pre-flash backup: everything the BCM lets us read and that is
+    worth keeping before a flash. The application P-Flash cannot be read back
+    (neither the application's bounded upload window nor the resident loader
+    exposes a bulk flash read), so this captures the irreplaceable and
+    identity-bearing data instead: identity, LIN/NAD coding, DTCs, the named
+    targets, and the boot page FF (the resident loader itself).
+    """
+    import copy
+    from flasher.readout import PQBCMPageFFReadout
+
+    base = Path(args.out)
+    manifest = {"controller_family": "pq-bcm", "module": BCM_MODULE_ADDR,
+                "operation": "backup", "output": str(base),
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "hardware_access": not args.dry_run,
+                "note": "Application P-Flash is not readable; this is identity/coding/boot-block only.",
+                "components": {}}
+    if args.dry_run:
+        manifest["status"] = "dry_run"
+        manifest["plan"] = {"diagnostics": sorted(codec.TARGETS),
+                            "pageff": "global 0x7FC000..0x7FFFFF (16 KiB)"}
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+    if base.exists() and any(base.iterdir()):
+        raise ValueError(f"Refusing to overwrite backup directory {base}")
+    base.mkdir(parents=True, exist_ok=True)
+
+    # 1) Diagnostic bundle: identity, LIN/NAD coding, DTCs and every named target.
+    diag = copy.copy(args)
+    diag.out = str(base / "diagnostics")
+    diag.bcm_subsystems = True
+    diag.bcm_dtcs = True
+    diag.bcm_measuring = None
+    diag.bcm_target = sorted(codec.TARGETS)
+    diag_code = _capture(diag, runtime, identify_only=False)
+    manifest["components"]["diagnostics"] = {"dir": "diagnostics", "exit_code": diag_code}
+
+    # 2) Boot page FF (the resident loader + vectors): the one irreplaceable block.
+    pageff = PQBCMPageFFReadout(open_device=lambda: runtime.open_adapter(args),
+                                progress_cb=runtime.progress, verbose=args.verbose)
+    try:
+        report = pageff.readout(str(base / "pageff"))
+        manifest["components"]["pageff"] = {"path": report.get("path"),
+                                            "sha256": report.get("sha256")}
+    except Exception as error:
+        manifest["components"]["pageff"] = {"error": str(error)}
+
+    manifest["status"] = ("ok" if diag_code == 0 and "error" not in manifest["components"]["pageff"]
+                          else "partial")
+    with (base / "backup_manifest.json").open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+    return 0 if manifest["status"] == "ok" else 1
+
+
 def run_pageff(args, runtime):
     """Read-only page FF dump; prints the saved .bin path on success."""
     from flasher.readout import PQBCMPageFFReadout
@@ -592,9 +672,23 @@ def run_flash(args, runtime):
     }
     if not args.input:
         raise ValueError("BCM flash requires --input")
-    prepared = bcm_flash.prepare_image(args.input, args.start, args.end,
-                                       regions=loader.regions)
-    plan["metadata"] = prepared["metadata"]
+
+    sectors = _resolve_sectors(args, bcm_flash)
+    if sectors is not None:
+        segments = bcm_flash.plan_sectors(args.input, sectors,
+                                          base=bcm_flash.BCM_IMAGE_BASE, regions=loader.regions)
+        plan["mode"] = "sectors"
+        plan["sectors"] = [f"0x{s:06X}" for s in sectors]
+        plan["segments"] = [{"start": "0x%06X" % s["metadata"]["start_addr"],
+                             "end": "0x%06X" % s["metadata"]["end_addr"],
+                             "size": s["metadata"]["size"],
+                             "checksum": "0x%04X" % s["metadata"]["checksum"]} for s in segments]
+    else:
+        prepared = bcm_flash.prepare_image(args.input, args.start, args.end,
+                                           regions=loader.regions)
+        segments = [prepared]
+        plan["mode"] = "range"
+        plan["metadata"] = prepared["metadata"]
 
     if args.dry_run:
         plan["status"] = "validated_dry_run"
@@ -614,7 +708,32 @@ def run_flash(args, runtime):
         loader, device=device, module=args.module,
         device_factory=lambda: runtime.open_adapter(args),
         progress_cb=runtime.progress, debug=args.verbose)
-    result = flasher.flash_prepared(prepared, recovery=args.recovery)
+    result = flasher.flash_segments(segments, recovery=args.recovery)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _resolve_sectors(args, bcm_flash):
+    """Return the selected P-Flash sector starts, or None for whole-range flash."""
+    starts = bcm_flash.pflash_sector_starts()
+    selected = []
+    for token in getattr(args, "bcm_sector", None) or []:
+        value = int(token, 0)
+        if value < len(starts):              # small value = sector index
+            selected.append(starts[value])
+        elif value in starts:                # otherwise a sector start address
+            selected.append(value)
+        else:
+            raise ValueError(f"--bcm-sector {token} is not a P-Flash sector index or start")
+    if getattr(args, "bcm_changed_only", False):
+        from pathlib import Path
+        image = Path(args.input).read_bytes()
+        reference = Path(args.reference).read_bytes()
+        changed = bcm_flash.changed_sectors(image, reference, base=bcm_flash.BCM_IMAGE_BASE)
+        if not changed:
+            raise ValueError("No P-Flash sectors differ from the reference; nothing to flash")
+        selected.extend(changed)
+    if not selected:
+        return None
+    return sorted(set(selected))
 

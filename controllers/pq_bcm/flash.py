@@ -67,6 +67,13 @@ BOOT_BLOCK = (0x7FC000, 0x7FFFFF)           # resident loader + vectors (protect
 PFLASH_SECTOR = 0x4000                      # 16 KiB erase/program sector
 FLASH_PHRASE = 0x08                         # loader programs 8-byte phrases
 
+# Flasher image contract: a full-span image, byte 0 = 0x780000, padded through
+# the boot block to 0x800000 -- same whole-span-with-padding convention as the
+# other families' binaries. Only the 31 P-Flash sectors below the boot block are
+# ever programmed; the boot-block tail is padding we never touch.
+BCM_IMAGE_BASE = 0x780000
+BCM_IMAGE_SIZE = 0x080000                   # 0x780000..0x7FFFFF inclusive
+
 
 class BCMFlashNotConfigured(RuntimeError):
     """A live BCM flash was requested without the data needed to run it safely."""
@@ -217,6 +224,73 @@ def prepare_image(source, start_addr, end_addr, file_off=None, simulator_mode=Fa
             "metadata": {"start_addr": start_addr, "end_addr": end_addr, "size": size,
                          "controller": "pq-bcm", "flash_region": list(region),
                          "checksum": sum16(payload), "checksum_kind": "sum16"}}
+
+
+def pflash_sector_starts() -> Tuple[int, ...]:
+    """The 31 erasable 16 KiB application P-Flash sectors (0x780000..0x7FBFFF)."""
+    lo, hi = PFLASH_REGION
+    return tuple(range(lo, hi, PFLASH_SECTOR))
+
+
+def sector_index(address: int) -> int:
+    """Index (0-based) of the P-Flash sector containing `address`."""
+    lo, hi = PFLASH_REGION
+    if not (lo <= address <= hi):
+        raise ValueError(f"0x{address:06X} is not in the application P-Flash window")
+    return (address - lo) // PFLASH_SECTOR
+
+
+def changed_sectors(image: bytes, reference: bytes, *, base: int = PFLASH_REGION[0]) -> Tuple[int, ...]:
+    """P-Flash sector starts whose bytes differ between image and reference.
+
+    Both buffers map linearly from `base`. Only sectors fully present in both
+    are compared; this is how "flash only what the patch changed" is planned.
+    """
+    starts = []
+    for start in pflash_sector_starts():
+        off = start - base
+        end = off + PFLASH_SECTOR
+        if end > len(image) or end > len(reference):
+            continue
+        if image[off:end] != reference[off:end]:
+            starts.append(start)
+    return tuple(starts)
+
+
+def _contiguous_runs(starts) -> Tuple[Tuple[int, int], ...]:
+    runs = []
+    for start in sorted(set(starts)):
+        end = start + PFLASH_SECTOR - 1
+        if runs and start == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], end)
+        else:
+            runs.append((start, end))
+    return tuple(runs)
+
+
+def plan_sectors(source, sector_starts, *, base: int = PFLASH_REGION[0],
+                 regions=BCM_FLASH_REGIONS):
+    """Build flash segments for the selected P-Flash sectors from one image.
+
+    `source` maps linearly from `base` (default 0x780000, the natural
+    full_flash_780000 layout). Contiguous selected sectors are coalesced into a
+    single erase/transfer/checksum cycle; non-contiguous ones become separate
+    segments flashed in one programming session. Every segment is validated and
+    checksummed by prepare_image (region, boot-block, alignment).
+    """
+    data = Path(source).read_bytes() if isinstance(source, (str, Path)) else bytes(source)
+    if not sector_starts:
+        raise ValueError("No sectors selected to flash")
+    lo, hi = PFLASH_REGION
+    for start in sector_starts:
+        if start % PFLASH_SECTOR or not (lo <= start <= hi):
+            raise ValueError(f"0x{start:06X} is not a valid 16 KiB P-Flash sector start")
+        if (start - base) < 0 or (start - base + PFLASH_SECTOR) > len(data):
+            raise ValueError(
+                f"Sector 0x{start:06X} is not fully present in the image "
+                f"(base 0x{base:06X}, {len(data)} bytes)")
+    return [prepare_image(data, run_start, run_end, file_off=base, regions=regions)
+            for run_start, run_end in _contiguous_runs(sector_starts)]
 
 
 def make_bcm_flash_profile(loader: LoaderConfig, *, kwp_factory, device_factory,

@@ -629,23 +629,76 @@ class PQFlasher:
         return tp, kwp
 
     def flash_prepared(self, prepared: dict, *, recovery=False):
-        """Flash an already validated target artifact using the common lifecycle."""
-        metadata = dict(prepared["metadata"])
+        """Flash a single validated target artifact using the common lifecycle."""
+        return self.flash_segments([prepared], recovery=recovery)
+
+    def _program_segment(self, kwp, segment, *, progress_lo, progress_hi):
+        """Run one download/erase/transfer/exit/checksum cycle for a segment.
+
+        Returns the (possibly reconnected) KWP client. Progress is reported
+        within [progress_lo, progress_hi] so multi-segment flashes advance the
+        bar smoothly across every segment.
+        """
+        metadata = segment["metadata"]
+        start_addr, end_addr = metadata["start_addr"], metadata["end_addr"]
+        erase_payload = self.profile.erase_payload(start_addr, end_addr, metadata)
+        checksum_payload = self.profile.checksum_payload(start_addr, end_addr, metadata)
+        span = max(progress_hi - progress_lo, 1)
+        self._cancel()
+        limit = kwp.request_download(start_addr, metadata["size"])
+        chunk = (min(self.profile.chunk_size, limit - 1) // 4) * 4
+        if chunk < 4:
+            raise RuntimeError("Controller transfer size is too small")
+        self._cancel()
+        self.destructive_started = self.recovery_required = True
+        self.report_progress("ERASING", progress_lo,
+                             f"Erasing 0x{start_addr:06X}..0x{end_addr:06X}")
+        kwp.routine(self.profile.erase_routine, erase_payload)
+        kwp = self._routine_done(kwp, self.profile.erase_routine)
+        region = segment["region"]
+        write_started = time.monotonic()
+        for offset in range(0, len(region), chunk):
+            self._cancel()
+            block = region[offset:offset + chunk]
+            # A timeout is ambiguous: TransferData is never resent.
+            kwp.transfer(block)
+            sent = offset + len(block)
+            speed = sent / max(time.monotonic() - write_started, 0.001)
+            self.report_progress("WRITING", progress_lo + span * 0.1 + span * 0.8 * sent / len(region),
+                                 f"0x{start_addr:06X}: {sent}/{len(region)} bytes", speed,
+                                 (len(region) - sent) / speed)
+        kwp.transfer_exit()
+        self.report_progress("VERIFYING", progress_lo + span * 0.95,
+                             f"Checking 0x{start_addr:06X} checksum")
+        kwp.routine(self.profile.checksum_routine, checksum_payload)
+        kwp = self._routine_done(kwp, self.profile.checksum_routine)
+        return kwp
+
+    def flash_segments(self, segments, *, recovery=False):
+        """Flash one or more validated segments in a single programming session.
+
+        Each segment is a prepared dict ({"region", "metadata"}); segments are
+        programmed in order with their own download/erase/transfer/checksum
+        cycle, then a single commit + fresh-application verification runs once.
+        A single-segment list is the classic whole-range flash.
+        """
+        if not segments:
+            raise ValueError("flash_segments requires at least one segment")
+        metadata = dict(segments[0]["metadata"])
         flash_date = system_flash_date()
         if flash_date is not None:
             metadata["flash_date"] = flash_date
-        start_addr = metadata["start_addr"]
-        end_addr = metadata["end_addr"]
-        # Materialize controller payloads before any hardware or destructive work.
-        erase_payload = self.profile.erase_payload(start_addr, end_addr, metadata)
-        checksum_payload = self.profile.checksum_payload(start_addr, end_addr, metadata)
+        plan = [{"start_addr": s["metadata"]["start_addr"],
+                 "end_addr": s["metadata"]["end_addr"],
+                 "size": s["metadata"]["size"]} for s in segments]
         started = time.monotonic()
         self.destructive_started = False
         self.recovery_required = False
         self.last_result = dict(metadata, checksum_verified=False, boot_verified=False,
                                 commit_outcome="not_attempted", controller=self.profile.name,
-                                recovery_mode=recovery)
-        self.log("PREFLIGHT " + json.dumps(metadata, sort_keys=True))
+                                recovery_mode=recovery, segments=plan)
+        self.log("PREFLIGHT " + json.dumps({"segments": plan, "flash_date":
+                                            metadata.get("flash_date")}, sort_keys=True))
         try:
             self._cancel()
             self.report_progress("CONNECTING", 5, "Opening exclusive diagnostic session")
@@ -658,33 +711,14 @@ class PQFlasher:
                 self.profile.validate_controller(controller_info, metadata)
                 self.last_result["source_controller"] = controller_info
             tp, kwp = self._enter_programming(tp, kwp, recovery=recovery)
-            self._cancel()
-            limit = kwp.request_download(start_addr, metadata["size"])
-            chunk = (min(self.profile.chunk_size, limit - 1) // 4) * 4
-            if chunk < 4:
-                raise RuntimeError("Controller transfer size is too small")
-            self._cancel()
-            self.destructive_started = self.recovery_required = True
-            self.report_progress("ERASING", 30, "Erasing selected regions")
-            kwp.routine(self.profile.erase_routine, erase_payload)
-            kwp = self._routine_done(kwp, self.profile.erase_routine)
-            region = prepared["region"]
-            write_started = time.monotonic()
-            for offset in range(0, len(region), chunk):
-                self._cancel()
-                block = region[offset:offset + chunk]
-                # A timeout is ambiguous: TransferData is never resent.
-                kwp.transfer(block)
-                sent = offset + len(block)
-                speed = sent / max(time.monotonic() - write_started, 0.001)
-                self.report_progress("WRITING", 35 + 55 * sent / len(region),
-                                     f"{sent}/{len(region)} bytes", speed,
-                                     (len(region) - sent) / speed)
-            kwp.transfer_exit()
-            self.report_progress("VERIFYING", 93, "Checking transferred image checksum")
-            kwp.routine(self.profile.checksum_routine,
-                        checksum_payload)
-            kwp = self._routine_done(kwp, self.profile.checksum_routine)
+            lo, hi, count = 25.0, 92.0, len(segments)
+            for index, segment in enumerate(segments):
+                seg_lo = lo + (hi - lo) * index / count
+                seg_hi = lo + (hi - lo) * (index + 1) / count
+                self.log(f"SEGMENT {index + 1}/{count} "
+                         f"0x{segment['metadata']['start_addr']:06X}.."
+                         f"0x{segment['metadata']['end_addr']:06X}")
+                kwp = self._program_segment(kwp, segment, progress_lo=seg_lo, progress_hi=seg_hi)
             self.last_result["checksum_verified"] = True
             self.report_progress("REBOOTING", 96, "Committing; fresh application verification required")
             outcomes = {}

@@ -39,8 +39,8 @@ FAMILIES = (
         module=0x20,
         module_aliases=("bcm", "cent-elec", "pq-bcm"),
         protocol_module="flasher.controllers.pq_bcm.protocol",
-        patches_module="",  # No anti-brick patch module; flash is a guarded scaffold.
-        operations=frozenset({"identify", "readout", "pageff", "flash"}),
+        patches_module="",  # No anti-brick patch module; boot-block self-protection only.
+        operations=frozenset({"identify", "readout", "pageff", "backup", "flash"}),
         part_prefixes=("8P0907063E",),
     ),
     ControllerFamily(
