@@ -223,13 +223,27 @@ python -m flasher.runner --module eps --input steer_dataset_4k.bin
 python -m flasher.controllers.pq_eps.patches rack_384k.bin                                   # report CRCs and known patches
 python -m flasher.controllers.pq_eps.patches rack_384k.bin --patch hca-timeout-minspeed      # writes rack_384k_hca-timeout-minspeed.bin
 python -m flasher.runner --module eps --input rack_384k_hca-timeout-minspeed.bin            # flash the 0x5D block
+python -m flasher.controllers.pq_eps.patches rack_384k.bin out.bin --patch hca-timeout-minspeed --patch slew-20 --gains 140,140,140
 ```
+
+Repeat `--patch` to combine patches. `--gains A,B,C` sets the HCA gains at
+0/50/120 km/h for all three steering variants (`A,B,C/D,E,F/G,H,I` sets each
+variant on its own). The patcher prints which blocks changed: 0x5D patches go
+out with the 0x5D block, gains with the 0x5E dataset. If both changed, flash the
+full firmware, or each block on its own.
 
 Available patches:
 
-| Patch | What it does | Firmware |
-|---|---|---|
-| `hca-timeout-minspeed` | Zeroes the HCA disengage countdown (so HCA doesn't time out) and the HCA minimum speed | `8J0909144J` 3001, `1K0909144R` 3501 |
+| Patch | What it does | Block | Firmware |
+|---|---|---|---|
+| `hca-timeout-minspeed` | Zeroes the HCA disengage countdown (so HCA doesn't time out) and the HCA minimum speed | 0x5D | `8J0909144J` 3001, `8J0909144P`/`1K0909144P` 3305, `1K0909144R` 3501 |
+| `slew-up-10` | HCA torque rise step (0x5D0A4) 1 -> 10, matching the fall step | 0x5D | `8J0909144P`/`1K0909144P` 3305 |
+| `slew-20` | HCA rise and fall steps (0x5D0A4/0x5D0A6) 1/10 -> 20/20 | 0x5D | `8J0909144P`/`1K0909144P` 3305 |
+| `hca-gain-140`, `hca-gain-160`, `--gains` | HCA speed-gain tables (Q7, 128 = 1.0x) | 0x5E | 3001 (`8J0909144J`/`1K0909144J`), 3305, `1K0909144R` 3501, and gen3 4 KiB datasets |
+
+The two slew patches are exclusive. HCA gains are capped at 160: at the largest
+HCA input, 160 gives 3.75 Nm against the rack's 3.8 Nm monitor, and tripping that
+monitor latches a fault until power is cycled.
 
 
 **Read-only diagnostics.** None of these unlock programming, clear faults or
