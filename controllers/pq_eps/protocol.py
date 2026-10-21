@@ -663,14 +663,15 @@ def run_recoveryflash(args, runtime):
         chunk = min(CHUNK_SIZE, limit - 1)
         if chunk < 4:
             raise RuntimeError("Controller transfer size too small")
-        print(f"[31 C4] erase 0x{start:05X}..0x{end:05X} + date stamp (channel may drop; staying silent)")
+        print(f"[31 C4] erase 0x{start:05X}..0x{end:05X} + date stamp")
         kwp.routine(RC_ERASE, a3(start) + a3(end) + eps_flash_stamp())
-        _safe_disconnect(tp)
-        tp = kwp = None
-
-        # Fixed post-erase reconnect, then poll 33 C4 with NO re-27.
-        tp, kwp = reconnect(args.recovery_reconnect_tries, "post-erase")
-        print("[33 C4] erase result (no re-27; STATE must survive)")
+        time.sleep(3.0)  # let a fast/blank erase finish before polling, so we don't
+        # poll into a still-running erase and get the channel closed under us.
+        # Poll 33 C4 on the LIVE channel. A fast (e.g. already-blank) erase keeps
+        # the channel up, so STATE survives and 33 C4 -> 73 C4 00. Do NOT tear the
+        # channel down here: a fresh TP2 channel resets the loader's STATE (-> 0x33).
+        # Reconnect ONLY if the erase actually drops the channel (the slow case).
+        print("[33 C4] erase result on live channel (reconnect only if it drops; no re-27)")
         done = False
         for _ in range(args.recovery_result_tries):
             try:
