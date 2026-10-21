@@ -79,6 +79,18 @@ def a3(value: int) -> bytes:
     return struct.pack(">I", value)[1:]
 
 
+def eps_flash_stamp() -> bytes:
+    """6-byte packed-BCD YYYYMMDDHHMM date for the 31 C4 erase frame.
+
+    The resident loader's erase guard (0x95CA) reads the 6 bytes at request+7
+    (i.e. immediately after start(3)+end(3)) and returns NRC 0x22 unless they are
+    non-zero; the success path (0x95E6) stores them as the EEPROM flash-date and
+    increments the attempt counter. So the erase payload MUST be
+    a3(start) + a3(end) + eps_flash_stamp() — omitting it is the cause of the
+    0x22-on-erase we hit for months."""
+    return bytes.fromhex(time.strftime("%Y%m%d%H%M"))
+
+
 EPS_FLASH_KWP_PROFILE = KWPProfile(
     exact_routine_responses={RC_ERASE: b"\x71\xC4\x01", RC_CHECKSUM: b"\x71\xC5"},
     reject_unprofiled_routines=True,
@@ -220,7 +232,7 @@ def make_eps_flash_profile(*, kwp_factory, image_preparer, device_factory,
         chunk_size=CHUNK_SIZE,
         erase_routine=RC_ERASE,
         checksum_routine=RC_CHECKSUM,
-        erase_payload=lambda start, end, metadata: a3(start) + a3(end),
+        erase_payload=lambda start, end, metadata: a3(start) + a3(end) + eps_flash_stamp(),
         checksum_payload=lambda start, end, metadata:
             a3(start) + a3(end) + struct.pack(">H", metadata["checksum"]),
         validate_fresh_application=validate_application,
@@ -290,6 +302,12 @@ def add_cli_arguments(parser):
 
 
 def apply_defaults(args):
+    if getattr(args, "recovery_flash", False):
+        if args.start is None:
+            args.start = FLASH_START
+        if args.end is None:
+            args.end = EPS_IMAGE_SIZE - 1
+        return
     if getattr(args, "probe_erase_budget", False):
         return
     if (args.read_eeprom or args.read_eps_faults or args.read_eps_motion
@@ -371,6 +389,13 @@ def validate_cli(parser, args):
                 or args.reference or args.readout_passes != 1
                 or args.readout_window != 0x10000 or args.readout_method != "auto"):
             parser.error("--read-eeprom cannot be combined with flash or CPU-readout options")
+        return
+    if getattr(args, "recovery_flash", False):
+        if not args.input:
+            parser.error("--recovery-flash requires --input (full CPU-linear image)")
+        if args.readout:
+            parser.error("--recovery-flash cannot be combined with readout options")
+        validate_selection(args.start, args.end)
         return
     if getattr(args, "probe_erase_budget", False):
         if args.input or args.readout:
@@ -499,7 +524,7 @@ def run_probe(args, runtime):
                 tp, kwp = make_tp()
                 EPS_PROGRAMMING_SECURITY.unlock(kwp)
                 kwp.request_download(start, size)            # 34
-                kwp.routine(RC_ERASE, a3(start) + a3(end))   # 31 C4 -> 71 C4 01
+                kwp.routine(RC_ERASE, a3(start) + a3(end) + eps_flash_stamp())  # 31 C4 -> 71 C4 01
                 step["erase_accepted"] = True
             except KWPNegativeResponse as nr:
                 step.update(erase_accepted=False, erase_nrc=f"0x{nr.code:02X}",
@@ -567,6 +592,152 @@ def run_probe(args, runtime):
         "region). Attempt counter has no lockout, so iterate freely."))
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
+
+
+def run_recoveryflash(args, runtime):
+    """Linear EPS recovery flash — a deterministic mirror of the proven
+    pq-flasher 03_flasher.py sequence on the pq35 J2534/TP2 stack, isolated from
+    the shared engine lifecycle. For a rack already sitting in its resident
+    loader (application erased). Steps: 27 unlock -> 34 RequestDownload -> 31 C4
+    erase -> (silent) fixed reconnect -> 33 C4 with NO re-27 (STATE survives the
+    drop) -> 36 TransferData with an explicit A3 keepalive per chunk -> 37 ->
+    31 C5 / 33 C5 checksum. No flash attempt-counter lockout exists, so retries
+    are safe.
+    """
+    prepared = prepare_image(args.input, args.start, args.end,
+                             correct_checksums=args.correct_checksum)
+    meta = prepared["metadata"]
+    start, end, size = meta["start_addr"], meta["end_addr"], meta["size"]
+    region, checksum = prepared["region"], meta["checksum"]
+    if size <= 0 or len(region) != size:
+        raise RuntimeError(f"Bad recovery region: size={size} len={len(region)}")
+    plan = {"operation": "recovery_flash", "module": args.module,
+            "start_addr": f"0x{start:05X}", "end_addr": f"0x{end:05X}", "size": size,
+            "checksum": f"0x{checksum:04X}", "prepared_sha256": meta["prepared_sha256"],
+            "reconnect_tries": args.recovery_reconnect_tries}
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    if args.dry_run:
+        print("No CAN traffic sent.")
+        return 0
+    if not args.yes and input(
+            f"Type YES to ERASE and FLASH EPS 0x{start:05X}..0x{end:05X}: ") != "YES":
+        print("Cancelled before adapter access.")
+        return 1
+
+    def connect():
+        try:
+            device.can_clear(0xFFFF)
+        except Exception:
+            pass
+        tp = TP20Transport(device, module=args.module, timeout=2.0,
+                           debug=args.verbose, legacy_ack=True)
+        return tp, EPSKWPClient(tp)
+
+    def reconnect(tries, label):
+        last = None
+        for _ in range(tries):
+            time.sleep(1.0)
+            try:
+                return connect()
+            except Exception as exc:
+                last = exc
+                print(f"  {label}: waiting for channel... ({type(exc).__name__})")
+        raise RuntimeError(f"{label}: no reconnect after {tries}s ({last})")
+
+    result = dict(plan)
+    tp = kwp = None
+    device = runtime.open_adapter(args)
+    try:
+        tp, kwp = connect()
+        info = decorate_identification(parse_vag_identification(
+            kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C)))
+        result["ecu"] = info
+        if not info.get("in_bootloader"):
+            raise RuntimeError(
+                f"EPS not in resident loader (system_desc={info.get('system_desc')!r}); "
+                "recovery-flash requires the loader")
+        print("[27] security unlock")
+        EPS_PROGRAMMING_SECURITY.unlock(kwp)
+        print(f"[34] request download 0x{start:05X} size 0x{size:X}")
+        limit = kwp.request_download(start, size)
+        chunk = min(CHUNK_SIZE, limit - 1)
+        if chunk < 4:
+            raise RuntimeError("Controller transfer size too small")
+        print(f"[31 C4] erase 0x{start:05X}..0x{end:05X} + date stamp (channel may drop; staying silent)")
+        kwp.routine(RC_ERASE, a3(start) + a3(end) + eps_flash_stamp())
+        _safe_disconnect(tp)
+        tp = kwp = None
+
+        # Fixed post-erase reconnect, then poll 33 C4 with NO re-27.
+        tp, kwp = reconnect(args.recovery_reconnect_tries, "post-erase")
+        print("[33 C4] erase result (no re-27; STATE must survive)")
+        done = False
+        for _ in range(args.recovery_result_tries):
+            try:
+                resp = kwp.routine_result(RC_ERASE)
+            except (TimeoutError, ConnectionError) as exc:
+                print(f"  erase-poll lost channel; reconnecting ({type(exc).__name__})")
+                _safe_disconnect(tp)
+                tp, kwp = reconnect(args.recovery_reconnect_tries, "erase-poll")
+                continue
+            except KWPNegativeResponse as nr:
+                raise RuntimeError(
+                    f"33 C4 rejected NRC 0x{nr.code:02X} "
+                    f"({'STATE reset - erase did not survive' if nr.code == 0x33 else 'sequence'})")
+            if resp == bytes([0x73, RC_ERASE, 0]):
+                done = True
+                break
+            if resp == bytes([0x73, RC_ERASE, 0x23]):
+                time.sleep(0.5)
+                continue
+            raise RuntimeError(f"33 C4 unexpected: {resp.hex()}")
+        if not done:
+            raise TimeoutError("erase never reported complete")
+        result["erase_ok"] = True
+
+        print(f"[36] transfer {len(region)} bytes in {chunk}-byte chunks (+A3 keepalive)")
+        sent = 0
+        for off in range(0, len(region), chunk):
+            kwp.transfer(region[off:off + chunk])
+            try:
+                tp.send_keep_alive()  # explicit A3 per chunk, matching 03_flasher.py
+            except Exception as exc:
+                raise RuntimeError(f"channel lost during transfer near 0x{start + off:05X}: {exc}")
+            sent += min(chunk, len(region) - off)
+            runtime.progress("WRITING", 100.0 * sent / len(region), f"0x{start + off:05X}")
+        print("[37] request transfer exit")
+        kwp.transfer_exit()
+        print(f"[31 C5] checksum 0x{checksum:04X}")
+        kwp.routine(RC_CHECKSUM, a3(start) + a3(end) + struct.pack(">H", checksum))
+        print("[33 C5] checksum result")
+        cres = None
+        for _ in range(args.recovery_result_tries):
+            try:
+                resp = kwp.routine_result(RC_CHECKSUM)
+            except KWPNegativeResponse as nr:
+                raise RuntimeError(f"33 C5 rejected NRC 0x{nr.code:02X}")
+            if resp == bytes([0x73, RC_CHECKSUM, 0]):
+                cres = resp
+                break
+            if resp == bytes([0x73, RC_CHECKSUM, 0x23]):
+                time.sleep(0.5)
+                continue
+            raise RuntimeError(f"33 C5 unexpected: {resp.hex()}")
+        if cres is None:
+            raise RuntimeError("checksum verify did not complete (image checksum mismatch?)")
+        result["status"] = "flashed"
+    except Exception as exc:
+        result["status"] = "failed"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if tp is not None:
+            _safe_disconnect(tp)
+        try:
+            device.close()
+        except Exception:
+            pass
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("status") == "flashed" else 1
 
 
 def run_readout(args, runtime):
