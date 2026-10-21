@@ -204,6 +204,9 @@ def build_parser(family=None):
                         help="Post-erase reconnect attempts (1s apart) during --recovery-flash")
     parser.add_argument("--recovery-result-tries", type=int, default=60,
                         help="33 C4/C5 result-poll attempts during --recovery-flash")
+    parser.add_argument("--commit", action="store_true",
+                        help="EPS: finalize an already-written app without re-flashing (27 unlock + 82 "
+                             "StopCommunication) so the loader validates it and boots it")
     parser.add_argument("--out")
     parser.add_argument("--reference")
     parser.add_argument("--readout-passes", type=int, choices=(1, 2), default=1)
@@ -257,6 +260,8 @@ def _operation(args):
         return "probe"
     if getattr(args, "recovery_flash", False):
         return "recoveryflash"
+    if getattr(args, "commit", False):
+        return "commit"
     if args.readout:
         return "readout"
     return "flash"
@@ -340,8 +345,8 @@ def main(argv=None):
             args.read_eps_motion, args.read_eps_assist, args.read_eps_supply,
             args.read_eps_can_config, args.read_bcm_pageff, getattr(args, "bcm_backup", False),
             getattr(args, "bcm_preconditions", False), getattr(args, "probe_erase_budget", False),
-            getattr(args, "recovery_flash", False))) > 1:
-        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup, preconditions, probe and recovery-flash operations cannot be combined")
+            getattr(args, "recovery_flash", False), getattr(args, "commit", False))) > 1:
+        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup, preconditions, probe, recovery-flash and commit operations cannot be combined")
     operation = _operation(args)
     if operation != "motion" and (args.motion_samples != 1 or args.motion_interval_ms != 100):
         parser.error("--motion-samples and --motion-interval-ms require --read-eps-motion")
