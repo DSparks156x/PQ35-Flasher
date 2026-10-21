@@ -200,8 +200,9 @@ def build_parser(family=None):
     parser.add_argument("--recovery-flash", action="store_true",
                         help="EPS: linear recovery flash of an already-bootloadered rack (mirrors the "
                              "proven pq-flasher sequence incl. the 31 C4 date stamp; needs --input full image)")
-    parser.add_argument("--recovery-reconnect-tries", type=int, default=15,
-                        help="Post-erase reconnect attempts (1s apart) during --recovery-flash")
+    parser.add_argument("--recovery-reconnect-tries", type=int, default=180,
+                        help="Post-erase wait/reconnect attempts (1s apart) during --recovery-flash; "
+                             "default 180s covers a full non-blank erase (~2 min)")
     parser.add_argument("--recovery-result-tries", type=int, default=60,
                         help="33 C4/C5 result-poll attempts during --recovery-flash")
     parser.add_argument("--commit", action="store_true",
