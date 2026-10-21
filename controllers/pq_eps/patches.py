@@ -7,9 +7,10 @@ Both the stock ``Ende`` trailer and an erased ``ff ff ff ff`` trailer are
 valid inputs. The only bytes it ever changes are dataset CRC words, and only
 when the caller asks for correct_checksums.
 
-Tune patches are exact-preimage manifests applied offline with
-``python -m flasher.controllers.pq_eps.patches``; the flasher then sends the
-patched file like any other image.
+Tune patches are exact-preimage manifests, plus the HCA gain tables of the 0x5E
+dataset, applied offline with ``python -m flasher.controllers.pq_eps.patches``
+(or ``apply_patches``); the flasher then sends the patched file like any other
+image.
 """
 import argparse
 import hashlib
@@ -302,14 +303,50 @@ class PatchManifest:
         return update_checksums(bytes(out))
 
 
-# Ported from pq-flasher 02_patcher.py ("3001_v2_hca" and "3501" there).
-# hca-timeout-minspeed zeroes the HCA disengage countdown (so HCA no longer
-# times out) and the HCA minimum speed. The bytes live in the 0x5D
+# 3001 and 3501 are ported from pq-flasher 02_patcher.py ("3001_v2_hca" and
+# "3501" there). hca-timeout-minspeed zeroes the HCA disengage countdown (so HCA
+# no longer times out) and the HCA minimum speed. The bytes live in the 0x5D
 # configuration block, so the default 0x5D flash sends them with their CRCs.
 # The end marker sits outside the datasets and only matters for a full flash.
 # Add a feature or firmware by adding a manifest here.
+#
+# The slew patches raise the HCA torque rise step at 0x5D0A4 (u16 LE, counts per
+# 2 ms task; stock 1) and, for slew-20, the fall step at 0x5D0A6 (stock 10).
+# That pair is the rise/fall step only from 3305 on: on 3001, 0x5D0A6 (0xCC) is
+# an unrelated ceiling, so these manifests are 3305 only. Golf and TT 3305 share
+# byte-identical code; only their identity strings differ.
 HCA_TIMEOUT_MINSPEED = "hca-timeout-minspeed"
+SLEW_UP_10 = "slew-up-10"
+SLEW_20 = "slew-20"
 END_MARKER_SITE = PatchSite(END_MARKER_OFFSET, b"Ende", b"\xff" * 4, "End of firmware marker")
+
+
+def _identity(address, part, version):
+    return PatchSite(address, f"{part} \x00{version}".encode(), None, "Software number and version")
+
+
+def _3305_manifests(part):
+    identity = _identity(0x5D824, part, "3305")
+    firmware = f"{part} 3305"
+    return (
+        PatchManifest(HCA_TIMEOUT_MINSPEED, firmware, (
+            identity,
+            PatchSite(0x5D285, b"\x64", b"\x00", "HCA disengage countdown"),
+            PatchSite(0x5D2F6, b"\x14", b"\x00", "HCA minimum speed"),
+        )),
+        PatchManifest(SLEW_UP_10, firmware, (
+            identity,
+            PatchSite(0x5D0A6, b"\x0a\x00", None, "HCA fall step 10"),
+            PatchSite(0x5D0A4, b"\x01\x00", b"\x0a\x00", "HCA rise step 1 -> 10"),
+        )),
+        PatchManifest(SLEW_20, firmware, (
+            identity,
+            PatchSite(0x5D0A4, b"\x01\x00", b"\x14\x00", "HCA rise step 1 -> 20"),
+            PatchSite(0x5D0A6, b"\x0a\x00", b"\x14\x00", "HCA fall step 10 -> 20"),
+        )),
+    )
+
+
 PATCH_MANIFESTS = (
     PatchManifest(HCA_TIMEOUT_MINSPEED, "8J0909144J 3001", (
         PatchSite(0x5D7A0, b"8J0909144J \x003001", None, "Software number and version"),
@@ -323,14 +360,145 @@ PATCH_MANIFESTS = (
         PatchSite(0x5D2FA, b"\x14", b"\x00", "HCA minimum speed"),
         END_MARKER_SITE,
     )),
+    *_3305_manifests("8J0909144P"),
+    *_3305_manifests("1K0909144P"),
 )
-FEATURES = tuple(dict.fromkeys(manifest.feature for manifest in PATCH_MANIFESTS))
+# Patches that write the same bytes; at most one of each group applies.
+EXCLUSIVE = (frozenset({SLEW_UP_10, SLEW_20}),)
+
+# HCA speed-gain tables in the gen3 0x5E steer dataset. A pointer table at
+# +0x150 holds one LE pointer per steering variant (the variant byte picks one,
+# 0..2) to an 8-byte LUT: u16 n = 3, x = 0/50/120 km/h, then three u8 gains in
+# Q7 (128 = 1.0x), linearly interpolated and flat outside the ends. Only HCA code
+# reads them (offset ramp and vibration amplitude). Documented for TT and Golf
+# 3001, TT 3305 (Golf 3305 has byte-identical code) and Golf 3501.
+GAIN_POINTERS = 0x150
+GAIN_LUTS = (0x664, 0x66C, 0x674)
+GAIN_HEADER = bytes.fromhex("0300003278")
+GAIN_SPEEDS = (0, 50, 120)
+# At the largest accepted HCA input (204), gain 160 gives 255 counts (3.75 Nm),
+# just under the 3.8 Nm float monitor at 0x5D09C. Past it the rack latches a
+# fatal fault until power is cycled. No higher gain is known to be safe.
+GAIN_MAX = 160
+GAIN_FIRMWARE = (
+    _identity(0x5D7A0, "8J0909144J", "3001"),
+    _identity(0x5D7A0, "1K0909144J", "3001"),
+    _identity(0x5D824, "8J0909144P", "3305"),
+    _identity(0x5D824, "1K0909144P", "3305"),
+    _identity(0x5D828, "1K0909144R", "3501"),
+)
+GAIN_PRESETS = {"hca-gain-140": 140, "hca-gain-160": 160}
+FEATURES = tuple(dict.fromkeys(manifest.feature for manifest in PATCH_MANIFESTS)) + tuple(GAIN_PRESETS)
+
+FEATURE_INFO = {
+    HCA_TIMEOUT_MINSPEED: "HCA timeout and minimum speed: zeroes the HCA disengage countdown "
+                          "and the HCA minimum speed",
+    SLEW_UP_10: "HCA slew up 10: rise step 1 -> 10, matching the fall step",
+    SLEW_20: "HCA slew up/down 20: rise and fall steps 1/10 -> 20/20",
+    "hca-gain-140": "HCA gain 140: all nine HCA speed-gain points set to 140 (1.09x)",
+    "hca-gain-160": "HCA gain 160: all nine HCA speed-gain points set to 160 (1.25x)",
+}
+
+
+def _gain_base(image: bytes) -> Optional[int]:
+    """Offset of the 0x5E dataset inside ``image`` when its HCA gain tables can be
+    edited: a gen3 4 KiB dataset, or a full image of a documented firmware."""
+    if len(image) == DATASET_SIZE:
+        return 0 if image[-8:-4] != CRC_MARKER else None
+    if len(image) != IMAGE_SIZE or image[0x5DFF8:0x5DFFC] != CRC_MARKER:
+        return None
+    if not any(site.state(image) == "match" for site in GAIN_FIRMWARE):
+        return None
+    return DATASET_START
+
+
+def hca_gains(image: bytes) -> Optional[list]:
+    """[[gain at 0, 50, 120 km/h] per variant 0..2], or None if this image has no
+    HCA gain tables in the known layout."""
+    base = _gain_base(image)
+    if base is None:
+        return None
+    for index, lut in enumerate(GAIN_LUTS):
+        pointer = image[base + GAIN_POINTERS + 4 * index:base + GAIN_POINTERS + 4 * index + 4]
+        if (int.from_bytes(pointer, "little") != DATASET_START + lut
+                or image[base + lut:base + lut + 5] != GAIN_HEADER):
+            return None
+    return [list(image[base + lut + 5:base + lut + 8]) for lut in GAIN_LUTS]
+
+
+def set_hca_gains(image: bytes, gains, correct_checksums: bool = False) -> bytes:
+    """Write the HCA gains (three per variant) and rewrite the dataset CRC."""
+    if hca_gains(image) is None:
+        raise UnsupportedFirmwarePatch(
+            "No HCA gain tables in the known layout for this image (documented for 3001, "
+            "3305 and 3501 gen3 datasets); image was not modified")
+    gains = [list(row) for row in gains]
+    if len(gains) != len(GAIN_LUTS) or any(len(row) != len(GAIN_SPEEDS) for row in gains):
+        raise ValueError("HCA gains need three values for each of the three variants")
+    if any(not isinstance(g, int) or not 0 <= g <= GAIN_MAX for row in gains for g in row):
+        raise ValueError(f"HCA gains must be whole numbers from 0 to {GAIN_MAX}")
+    check_checksums(image, correct=correct_checksums)
+    base = _gain_base(image)
+    out = bytearray(image)
+    for lut, row in zip(GAIN_LUTS, gains):
+        out[base + lut + 5:base + lut + 8] = bytes(row)
+    return update_checksums(bytes(out))
 
 
 def known_patches(image: bytes) -> dict:
-    """Status of every manifest made for this image's firmware."""
-    return {manifest.name: status for manifest in PATCH_MANIFESTS
-            if (status := manifest.status(image)) is not None}
+    """Status of every manifest made for this image's firmware, and of the gain
+    presets when the image has HCA gain tables."""
+    status = {manifest.name: state for manifest in PATCH_MANIFESTS
+              if (state := manifest.status(image)) is not None}
+    gains = hca_gains(image)
+    if gains is not None:
+        for feature, value in GAIN_PRESETS.items():
+            status[feature] = "applied" if all(g == value for row in gains for g in row) else "stock"
+    return status
+
+
+def patch_options(image: bytes) -> dict:
+    """Everything the patcher can do to this image, for a UI."""
+    found = known_patches(image)
+    features = []
+    for feature in FEATURES:
+        if feature in GAIN_PRESETS:
+            name = feature if feature in found else None
+        else:
+            name = next((m.name for m in PATCH_MANIFESTS if m.feature == feature
+                         and m.status(image) is not None), None)
+        features.append({"feature": feature, "description": FEATURE_INFO.get(feature, feature),
+                         "manifest": name, "status": found.get(name) if name else None,
+                         "group": next((sorted(g) for g in EXCLUSIVE if feature in g), None)})
+    return {"features": features, "gains": hca_gains(image), "gain_speeds": list(GAIN_SPEEDS),
+            "gain_max": GAIN_MAX}
+
+
+def apply_patches(image: bytes, features=(), gains=None, correct_checksums: bool = False) -> bytes:
+    """Apply several patches (and optionally explicit HCA gains) in one pass.
+
+    Manifest patches need a full image of their firmware; gains also work on a
+    4 KiB dataset. Every patch is checked before anything is written."""
+    features = list(dict.fromkeys(features))
+    unknown = [f for f in features if f not in FEATURES]
+    if unknown:
+        raise ValueError(f"Unknown PQ EPS patch: {', '.join(unknown)}")
+    for group in EXCLUSIVE:
+        if len(group & set(features)) > 1:
+            raise ValueError(f"Choose only one of {', '.join(sorted(group))}")
+    presets = [f for f in features if f in GAIN_PRESETS]
+    if len(presets) + (gains is not None) > 1:
+        raise ValueError("Choose one HCA gain preset or explicit gains, not several")
+    if presets:
+        gains = [[GAIN_PRESETS[presets[0]]] * len(GAIN_SPEEDS) for _ in GAIN_LUTS]
+    manifests = [require_patch_manifest(image, f) for f in features if f not in GAIN_PRESETS]
+    check_checksums(image, correct=correct_checksums)
+    out = update_checksums(image) if correct_checksums else image
+    for manifest in manifests:
+        out = manifest.apply(out)
+    if gains is not None:
+        out = set_hca_gains(out, gains)
+    return out
 
 
 def require_patch_manifest(image: bytes, feature: str) -> PatchManifest:
@@ -360,38 +528,63 @@ def report(image: bytes) -> bool:
         print(f"patch {name}: {status}")
     if not patches:
         print("no known patch manifest for this firmware")
+    gains = hca_gains(image)
+    if gains is not None:
+        speeds = "/".join(str(s) for s in GAIN_SPEEDS)
+        for index, row in enumerate(gains):
+            print(f"HCA gain variant {index} at {speeds} km/h: {' '.join(str(g) for g in row)}")
     return valid
+
+
+def parse_gains(text: str) -> list:
+    """'a,b,c' for every variant, or 'a,b,c/d,e,f/g,h,i' per variant."""
+    rows = [[int(v) for v in row.split(",")] for row in text.split("/")]
+    if len(rows) == 1:
+        rows = rows * len(GAIN_LUTS)
+    return rows
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="PQ EPS rack image checker and patcher (offline).")
     parser.add_argument("input_bin", help="384 KiB CPU-linear rack image (or 4 KiB 0x5E dataset)")
     parser.add_argument("output_bin", nargs="?", help="Output for --patch (default: INPUT_<patch>.bin)")
-    parser.add_argument("--patch", choices=FEATURES,
+    parser.add_argument("--patch", choices=FEATURES, action="append", default=[],
                         help="Apply this patch (the manifest is picked from the image's firmware); "
-                             "without it, only report CRCs and known patches")
+                             "repeat to combine patches. Without it, only report CRCs and known patches")
+    parser.add_argument("--gains", type=parse_gains, metavar="A,B,C[/D,E,F/G,H,I]",
+                        help=f"Set the HCA gains at {'/'.join(str(s) for s in GAIN_SPEEDS)} km/h "
+                             f"(Q7, 128 = 1.0x, at most {GAIN_MAX}): one triple for every variant, "
+                             "or one per variant 0..2 separated by /")
     parser.add_argument("--correct-checksum", action="store_true",
                         help="Accept an input whose dataset CRCs are wrong")
     args = parser.parse_args(argv)
     image = Path(args.input_bin).read_bytes()
-    if not args.patch:
+    if not args.patch and args.gains is None:
         if args.output_bin or args.correct_checksum:
-            parser.error("an output file and --correct-checksum need --patch")
+            parser.error("an output file and --correct-checksum need --patch or --gains")
         return 0 if report(image) else 1
     try:
-        validate_image(image)
-        manifest = require_patch_manifest(image, args.patch)
-        patched = manifest.apply(image, args.correct_checksum)
+        patched = apply_patches(image, args.patch, args.gains, args.correct_checksum)
     except ValueError as exc:
         parser.exit(1, f"Not patched: {exc}\n")
     source = Path(args.input_bin)
-    output = Path(args.output_bin or source.with_name(f"{source.stem}_{args.patch}{source.suffix}"))
+    suffix = "_".join(args.patch + (["hca-gains"] if args.gains is not None else []))
+    output = Path(args.output_bin or source.with_name(f"{source.stem}_{suffix}{source.suffix}"))
     output.write_bytes(patched)
-    print(f"applied {manifest.name}")
-    for change in _changes(image, patched, 0):
+    print(f"applied {', '.join(args.patch + (['HCA gains'] if args.gains is not None else []))}")
+    base = DATASET_START if len(image) == DATASET_SIZE else 0
+    for change in _changes(image, patched, base):
         print(f"  0x{change['address']:05X}: {change['before']} -> {change['after']}")
     print(f"wrote {output}")
-    print("Flash the 0x5D block (the default), or the full firmware to also send the end marker.")
+    blocks = sorted({(base + i) & ~0xFFF for i in range(len(image))
+                     if image[i] != patched[i] and base + i < END_MARKER_OFFSET})
+    if blocks == [0x5D000]:
+        print("Flash the 0x5D block (the default), or the full firmware to also send the end marker.")
+    elif blocks == [DATASET_START]:
+        print("Flash the 0x5E dataset (--start 0x5E000 --end 0x5EFFF), or pass the 4 KiB dataset.")
+    else:
+        print("This changes " + " and ".join(f"0x{b >> 12:X}" for b in blocks) + ": flash the "
+              "full firmware, or each block on its own.")
     return 0
 
 
