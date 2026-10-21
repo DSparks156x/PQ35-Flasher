@@ -85,6 +85,9 @@ class PQFlashProfile:
     validate_fresh_application: Callable[[dict], None]
     commit_services: Tuple[int, ...] = (0x20, 0x82)
     programming_reconnect_delay: float = 0.0
+    # A fresh TP2 channel opened while polling a routine starts without the
+    # programming security of the lost one; re-verify the loader and unlock it.
+    resecure_after_reconnect: bool = False
 
 
 def parse_vag_flash_date(raw: bytes) -> Optional[str]:
@@ -587,7 +590,14 @@ class PQFlasher:
                 if isinstance(exc, ConnectionError):
                     self._tp = None
                 time.sleep(0.5)
-                kwp = self._new_kwp(self.reconnect_tp(15, heartbeat=True))
+                tp = self.reconnect_tp(15, heartbeat=True)
+                kwp = self._new_kwp(tp)
+                if self.profile.resecure_after_reconnect:
+                    self.log(f"[TP20] re-verifying the loader and programming security "
+                             f"before polling routine 0x{routine:02X} again")
+                    self.profile.verify_programming_channel(tp)
+                    if self.profile.programming_security is not None:
+                        self.profile.programming_security.unlock(kwp)
                 continue
             except RuntimeError as exc:
                 if "NRC 0x23" not in str(exc):

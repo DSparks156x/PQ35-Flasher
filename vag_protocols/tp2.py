@@ -177,8 +177,13 @@ class TP2Transport:
     def __init__(self, device, module: int = 0x0A, bus: int = 0,
                  timeout: float = 2.0, debug: bool = False, log_fn=None,
                  intercept: bool = False, tester_id: int = 0x300,
-                 auto_open: bool = True):
+                 auto_open: bool = True, legacy_ack: bool = False):
         self.device = device
+        # legacy_ack keeps the ACK handling from before explicit retransmission
+        # (8d98ca7): a 9n only extends the wait for the Bn ACK, nothing is ever
+        # replayed, and any response frame acknowledges. The PQ EPS flash path
+        # uses it; its loader closed the channel at erase under the newer rules.
+        self.legacy_ack = legacy_ack
         self.module = module
         self.bus = bus
         self.timeout = timeout
@@ -336,6 +341,8 @@ class TP2Transport:
         require a separate readiness handshake when n already acknowledges all
         frames. Silence never requests retransmission.
         """
+        if self.legacy_ack:
+            return self._wait_for_ack_legacy(sent_sequence)
         if not 0 <= sent_sequence <= 0x0F:
             raise ValueError("TP2 sequence must be 0..15")
         expected_sequence = (sent_sequence + 1) & 0x0F
@@ -403,11 +410,51 @@ class TP2Transport:
                 return
         raise TP2Error(f"Did not receive expected ACK 0x{expected:02X}")
 
+    def _wait_for_ack_legacy(self, sent_sequence: int):
+        expected = 0xB0 | ((sent_sequence + 1) & 0x0F)
+        started = time.monotonic()
+        deadline = started + self.timeout
+        hard_deadline = started + 30.0
+        while time.monotonic() < deadline:
+            try:
+                data = self.can_recv()
+            except MessageTimeoutError:
+                break
+            if not data:
+                continue
+            if (data[0] & 0xF0) == 0x90:
+                deadline = min(deadline + 1.0, hard_deadline)
+            elif data[0] == 0xA8:
+                self._peer_disconnected()
+                raise ConnectionError("Controller closed TP2 channel while waiting for ACK")
+            elif data[0] == 0xA3:
+                self.can_send(CHANNEL_PARAMETERS_RESPONSE)
+            elif data[0] == expected:
+                return
+            elif data[0] >> 4 in (0, 1, 2, 3):
+                self.msgs.insert(0, (self.rx_addr, data))
+                return
+        raise TP2Error(f"Did not receive expected ACK 0x{expected:02X}")
+
+    def _send_legacy(self, payload: bytes):
+        self.msgs = [(a, d) for a, d in self.msgs
+                     if d and (d[0] & 0xF0) != 0xB0]
+        frames, next_sequence = segment_message(
+            payload, self.tx_seq, block_size=self.block_size, length_prefixed=True)
+        for frame in frames:
+            self.can_send(frame)
+            if frame[0] >> 4 in (0, 1):
+                self._wait_for_ack_legacy(frame[0] & 0x0F)
+        self.tx_seq = next_sequence
+
     def send(self, payload: bytes):
         payload = bytes(payload)
         if len(payload) > 0xFFFF:
             raise ValueError("TP2 payload exceeds 65535 bytes")
         self.last_request_at = time.monotonic()
+        if self.legacy_ack:
+            self._send_legacy(payload)
+            return
         # Queued acknowledgements predate this message and cannot request a
         # replay of its not-yet-sent frames.
         queued_not_ready = any(d and (d[0] & 0xF0) == 0x90 for _, d in self.msgs)

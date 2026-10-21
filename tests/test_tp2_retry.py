@@ -234,5 +234,57 @@ class ExplicitReplayTests(unittest.TestCase):
         self.assertIsNone(transport.wait_for_ack(9))
 
 
+class LegacyAckTests(unittest.TestCase):
+    """legacy_ack (the PQ EPS flash path) keeps the pre-8d98ca7 ACK rules."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        p = patch.object(tp2, "time", types.SimpleNamespace(
+            monotonic=self.clock.monotonic, sleep=self.clock.sleep))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def transport(self, replies, sequence=9):
+        device = FakeCAN(self.clock, replies)
+        transport = tp2.TP2Transport.fixed_channel(
+            device, tx_addr=0x338, rx_addr=0x300, timeout=0.2, block_size=15, t3_ms=1)
+        transport.legacy_ack = True
+        transport.tx_seq = sequence
+        return transport, device
+
+    @staticmethod
+    def sent(device):
+        return [frame for _, _, frame, _ in device.sent]
+
+    def test_notready_only_waits_for_the_ready_ack(self):
+        transport, device = self.transport([b"\x9a", b"\xba"])
+        transport.send(b"\x36")
+        self.assertEqual(self.sent(device), [bytes.fromhex("19000136")])
+        self.assertNotIn(tp2.NOT_READY_WAIT_SECONDS, self.clock.sleeps)
+        self.assertEqual(transport.tx_seq, 10)
+
+    def test_notready_alone_is_not_an_ack(self):
+        transport, device = self.transport([b"\x9a"])
+        with self.assertRaisesRegex(tp2.TP2Error, "expected ACK 0xBA"):
+            transport.send(b"\x36")
+        self.assertEqual(len(self.sent(device)), 1)
+
+    def test_rewind_requests_are_never_replayed(self):
+        transport, device = self.transport([b"\x99", b"\xba"])
+        transport.send(b"\x36")
+        self.assertEqual(self.sent(device), [bytes.fromhex("19000136")])
+
+    def test_response_frame_acknowledges_and_is_preserved(self):
+        transport, _ = self.transport([bytes.fromhex("1d000176")])
+        transport.rx_seq = 13
+        transport.send(b"\x36")
+        self.assertEqual(transport.recv(), b"\x76")
+
+    def test_disconnect_while_waiting_raises_connection_error(self):
+        transport, _ = self.transport([b"\xa8"])
+        with self.assertRaisesRegex(ConnectionError, "closed TP2 channel"):
+            transport.send(b"\x36")
+
+
 if __name__ == "__main__":
     unittest.main()
