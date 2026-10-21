@@ -88,6 +88,10 @@ class PQFlashProfile:
     # A fresh TP2 channel opened while polling a routine starts without the
     # programming security of the lost one; re-verify the loader and unlock it.
     resecure_after_reconnect: bool = False
+    # (start, end) -> True when the loader drops the TP2 channel while it
+    # erases that range. Nothing more is sent on it; after a wait the erase is
+    # polled on a fresh channel (the sequence of pq-flasher's 03_flasher.py).
+    reconnect_after_erase: Optional[Callable[[int, int], bool]] = None
 
 
 def parse_vag_flash_date(raw: bytes) -> Optional[str]:
@@ -579,7 +583,29 @@ class PQFlasher:
                       if self.destructive_started else "")
             raise RuntimeError("Cancellation requested; operation stopped" + suffix)
 
-    def _routine_done(self, kwp, routine):
+    def _resecure(self, kwp, routine):
+        self.log(f"[TP20] re-verifying the loader and programming security "
+                 f"before polling routine 0x{routine:02X} again")
+        self.profile.verify_programming_channel(self._tp)
+        if self.profile.programming_security is not None:
+            self.profile.programming_security.unlock(kwp)
+
+    def _reconnect_after_erase(self, routine, tries=10):
+        """Abandon the channel the loader drops while erasing, then reconnect."""
+        self.log(f"[TP20] routine 0x{routine:02X} started; the loader drops the channel "
+                 "while erasing, reconnecting")
+        self._tp = None  # nothing more is sent on it, not even A8
+        for attempt in range(tries):
+            self._cancel()
+            time.sleep(1.0)
+            try:
+                return self._new_kwp(self.reconnect_tp(1, heartbeat=True))
+            except Exception:
+                if attempt == tries - 1:
+                    raise
+
+    def _routine_done(self, kwp, routine, *, reconnected=False):
+        resecured = False
         for _ in range(30):
             self._cancel()
             try:
@@ -590,16 +616,18 @@ class PQFlasher:
                 if isinstance(exc, ConnectionError):
                     self._tp = None
                 time.sleep(0.5)
-                tp = self.reconnect_tp(15, heartbeat=True)
-                kwp = self._new_kwp(tp)
+                kwp = self._new_kwp(self.reconnect_tp(15, heartbeat=True))
+                reconnected = True
                 if self.profile.resecure_after_reconnect:
-                    self.log(f"[TP20] re-verifying the loader and programming security "
-                             f"before polling routine 0x{routine:02X} again")
-                    self.profile.verify_programming_channel(tp)
-                    if self.profile.programming_security is not None:
-                        self.profile.programming_security.unlock(kwp)
+                    self._resecure(kwp, routine)
+                    resecured = True
                 continue
             except RuntimeError as exc:
+                if ("NRC 0x33" in str(exc) and reconnected and not resecured
+                        and self.profile.resecure_after_reconnect):
+                    self._resecure(kwp, routine)
+                    resecured = True
+                    continue
                 if "NRC 0x23" not in str(exc):
                     raise
                 time.sleep(0.5)
@@ -664,7 +692,12 @@ class PQFlasher:
         self.report_progress("ERASING", progress_lo,
                              f"Erasing 0x{start_addr:06X}..0x{end_addr:06X}")
         kwp.routine(self.profile.erase_routine, erase_payload)
-        kwp = self._routine_done(kwp, self.profile.erase_routine)
+        if (self.profile.reconnect_after_erase is not None
+                and self.profile.reconnect_after_erase(start_addr, end_addr)):
+            kwp = self._reconnect_after_erase(self.profile.erase_routine)
+            kwp = self._routine_done(kwp, self.profile.erase_routine, reconnected=True)
+        else:
+            kwp = self._routine_done(kwp, self.profile.erase_routine)
         region = segment["region"]
         write_started = time.monotonic()
         for offset in range(0, len(region), chunk):
