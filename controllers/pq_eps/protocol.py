@@ -604,21 +604,24 @@ def run_recoveryflash(args, runtime):
     """Robust full-app EPS flash/recovery, two-phase, for a rack in its resident
     loader. Works whether the erase is instant (blank app) or ~2 minutes (non-blank).
 
-    The loader erases the whole app window in one interrupts-off block; a non-blank
-    erase takes long enough to freeze the CPU, drop TP2, and (on reconnect) reset the
-    loader's programming STATE -> 33 C4 = 0x33. A blank erase is fast (per-block
-    blank-check skips it), keeps the channel, and STATE survives. So:
+    The loader erases the whole app window in one interrupts-off block, so a non-blank
+    erase freezes the CPU (seconds..~2 min) and TP2 drops. The trap that cost us: a
+    33 C4 poked into the frozen ECU times out its ACK and trips the loader's abort/
+    reset path -> STATE zeroed -> 33 C4 = 0x33. The fix is to NOT touch the ECU while
+    it erases:
 
-      PHASE 1  27 -> 34 -> 31 C4 erase, then WAIT for the ECU to return (tolerating a
-               dropped channel / 0x22-busy ident). The erase completes regardless;
-               STATE loss is irrelevant because nothing is written. App ends blank.
-      PHASE 2  27 -> 34 -> 31 C4 (now fast on blank) -> settle -> 33 C4 on the LIVE
-               channel (no re-27, reconnect only if it drops) -> 36 TransferData with
-               an A3 keepalive per chunk -> 37 -> 31 C5 / 33 C5 checksum -> 82 commit.
+      27 -> 34 -> 31 C4 erase, then go SILENT: drop our channel and only retry a bare
+      TP2 setup until it succeeds (which only happens once the CPU is back == erase
+      done). A clean reconnect preserves STATE, so 33 C4 RESUMES at STATE 6 -> 73 C4 00
+      and we flash single-phase: 36 TransferData (+A3 keepalive/chunk) -> 37 ->
+      31 C5 / 33 C5 checksum -> 82 commit.
 
-    The 31 C4 payload carries a 6-byte date stamp (loader rejects a zero stamp with
-    0x22), and 0x82 finalizes so the loader validates the app and boots it. No flash
-    attempt-counter lockout exists, so this is safe to repeat.
+    Fallback: if that resume returns 0x33 (the loader did reset STATE after all), the
+    app is now blank, so a second erase is fast, holds the channel, and reaches 6->7;
+    then the same transfer/checksum/commit runs. Works whether the erase is instant or
+    ~2 minutes. The 31 C4 payload carries a 6-byte date stamp (a zero stamp is rejected
+    0x22); 0x82 finalizes so the loader validates and boots the app. No attempt-counter
+    lockout exists, so this is safe to repeat.
     """
     prepared = prepare_image(args.input, args.start, args.end,
                              correct_checksums=args.correct_checksum)
@@ -671,29 +674,21 @@ def run_recoveryflash(args, runtime):
             session.routine(RC_ERASE, a3(start) + a3(end) + eps_flash_stamp())
             return lim
 
-        def wait_ecu_ready(tries, label):
-            # After a slow (non-blank) erase the CPU is frozen in one interrupts-off
-            # block, so TP2 drops and/or ident returns 0x22 (busy). The erase still
-            # completes in the background. Poll until the loader answers ident cleanly,
-            # then hand back a fresh session. STATE loss here is fine: nothing is
-            # written in phase 1.
+        def wait_channel_back(tries, label):
+            # Silently wait for the loader to return after an erase. We ONLY retry a
+            # bare TP2 channel setup (connect) — no KWP frame is ever sent while the
+            # CPU may be frozen mid-erase, so nothing can trip the loader's abort/
+            # reset path. connect() can only succeed once the CPU is running again,
+            # i.e. the erase has finished. This is what keeps STATE intact.
             last = None
             for _ in range(tries):
                 time.sleep(1.0)
-                t = k = None
                 try:
-                    t, k = connect()
-                    k.read_ecu_ident(0x9B)  # clean ident => erase done, loader idle
-                    return t, k
-                except KWPNegativeResponse as nr:  # 0x22 busy / still erasing
-                    last = f"ident NRC 0x{nr.code:02X}"
-                    if t is not None:
-                        _safe_disconnect(t)
-                    print(f"  {label}: ECU busy ({last})...")
+                    return connect()
                 except Exception as exc:
                     last = type(exc).__name__
-                    print(f"  {label}: waiting for channel... ({last})")
-            raise RuntimeError(f"{label}: ECU not ready after {tries}s ({last})")
+                    print(f"  {label}: silent, waiting for erase/loader... ({last})")
+            raise RuntimeError(f"{label}: loader did not return after {tries}s ({last})")
 
         tp, kwp = connect()
         info = decorate_identification(parse_vag_identification(
@@ -704,41 +699,36 @@ def run_recoveryflash(args, runtime):
                 f"EPS not in resident loader (system_desc={info.get('system_desc')!r}); "
                 "recovery-flash requires the loader")
 
-        # ---- PHASE 1/2: blank the app. A slow (non-blank) erase drops the channel;
-        # that is expected and fine — the erase completes regardless and STATE loss
-        # here doesn't matter because we write nothing yet. If the app is already
-        # blank this returns almost immediately.
-        print("PHASE 1/2: blanking the application (a slow erase + channel drop is expected)")
-        unlock_download_erase(kwp)
+        # Erase the whole app window. The loader does it in one interrupts-off block,
+        # so a non-blank erase freezes the CPU (seconds..~2 min) and the channel drops.
+        print("[27] unlock  [34] requestDownload  [31 C4] erase + date stamp")
+        limit = unlock_download_erase(kwp)
+
+        # Stay SILENT while the erase runs: drop our channel and only retry bare TP2
+        # setup until the CPU is back (erase done). Poking 33 C4 into the frozen ECU
+        # is exactly what trips the abort/reset -> 0x33; not doing so keeps STATE.
         _safe_disconnect(tp)
         tp = kwp = None
-        print("  waiting for the erase to finish and the loader to return...")
-        tp, kwp = wait_ecu_ready(args.recovery_reconnect_tries, "blank-wait")
-        print("  application is blank; loader is back.")
+        print("  erase running: silent, waiting for the loader to return...")
+        tp, kwp = wait_channel_back(args.recovery_reconnect_tries, "erase-wait")
 
-        # ---- PHASE 2/2: program the now-blank app. The erase is fast on blank flash
-        # (per-block blank-check skips it), so the channel stays up, STATE survives,
-        # and 33 C4 -> 73 C4 00 without any reconnect.
-        print("PHASE 2/2: programming the application (erase now fast on blank flash)")
-        limit = unlock_download_erase(kwp)
-        chunk = min(CHUNK_SIZE, limit - 1)
-        if chunk < 4:
-            raise RuntimeError("Controller transfer size too small")
-        time.sleep(3.0)  # let the fast/blank erase settle before polling on the live channel
-        print("[33 C4] erase result on live channel (reconnect only if it drops; no re-27)")
+        # RESUME on the clean reconnect. A clean TP2 reconnect should preserve the
+        # loader's STATE (==6), so 33 C4 -> 73 C4 00 and we flash single-phase. Only
+        # if the loader actually reset STATE (33 C4 -> 0x33) do we fall back: the app
+        # is blank now, so a SECOND erase is fast, keeps the channel, and reaches 6->7.
+        print("[33 C4] resume on clean reconnect (no re-27)")
         done = False
+        resume_nrc = None
         for _ in range(args.recovery_result_tries):
             try:
                 resp = kwp.routine_result(RC_ERASE)
-            except (TimeoutError, ConnectionError) as exc:
-                print(f"  erase-poll lost channel; reconnecting ({type(exc).__name__})")
+            except (TimeoutError, ConnectionError):
                 _safe_disconnect(tp)
-                tp, kwp = reconnect(args.recovery_reconnect_tries, "erase-poll")
+                tp, kwp = wait_channel_back(args.recovery_reconnect_tries, "erase-wait")
                 continue
             except KWPNegativeResponse as nr:
-                raise RuntimeError(
-                    f"33 C4 rejected NRC 0x{nr.code:02X} "
-                    f"({'STATE reset - erase did not survive' if nr.code == 0x33 else 'sequence'})")
+                resume_nrc = nr.code
+                break
             if resp == bytes([0x73, RC_ERASE, 0]):
                 done = True
                 break
@@ -746,8 +736,40 @@ def run_recoveryflash(args, runtime):
                 time.sleep(0.5)
                 continue
             raise RuntimeError(f"33 C4 unexpected: {resp.hex()}")
-        if not done:
-            raise TimeoutError("erase never reported complete")
+
+        if done:
+            print("  resume OK — STATE survived the clean reconnect (single-phase).")
+            result["mode"] = "single_phase_resume"
+        else:
+            print(f"  resume blocked (NRC 0x{resume_nrc:02X}): STATE was reset. App is blank "
+                  f"now -> second fast erase on blank (two-phase fallback).")
+            result["mode"] = "two_phase_fallback"
+            limit = unlock_download_erase(kwp)      # fresh 27->34->31C4 on the blank app
+            time.sleep(3.0)
+            for _ in range(args.recovery_result_tries):
+                try:
+                    resp = kwp.routine_result(RC_ERASE)
+                except (TimeoutError, ConnectionError):
+                    _safe_disconnect(tp)
+                    tp, kwp = reconnect(args.recovery_reconnect_tries, "erase-poll")
+                    continue
+                except KWPNegativeResponse as nr:
+                    raise RuntimeError(
+                        f"fallback 33 C4 rejected NRC 0x{nr.code:02X} "
+                        f"({'blank erase still too slow to hold the channel' if nr.code == 0x33 else 'sequence'})")
+                if resp == bytes([0x73, RC_ERASE, 0]):
+                    done = True
+                    break
+                if resp == bytes([0x73, RC_ERASE, 0x23]):
+                    time.sleep(0.5)
+                    continue
+                raise RuntimeError(f"33 C4 unexpected: {resp.hex()}")
+            if not done:
+                raise TimeoutError("second (blank) erase never reported complete")
+
+        chunk = min(CHUNK_SIZE, limit - 1)
+        if chunk < 4:
+            raise RuntimeError("Controller transfer size too small")
         result["erase_ok"] = True
 
         print(f"[36] transfer {len(region)} bytes in {chunk}-byte chunks (+A3 keepalive)")
