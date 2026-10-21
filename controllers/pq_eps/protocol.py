@@ -13,7 +13,7 @@ from ...engine import (
     SecurityAccess, add32, capture_sparse, parse_vag_identification,
 )
 from ...socketcan_device import SocketCANDevice
-from ...vag_protocols.kwp import KWPClient, KWPProfile
+from ...vag_protocols.kwp import KWPClient, KWPNegativeResponse, KWPProfile
 from ...vag_protocols.tp2 import TP20Transport
 from .patches import (
     DATASET_END, DATASET_SIZE, DATASET_START, DEFAULT_END, DEFAULT_START,
@@ -290,6 +290,8 @@ def add_cli_arguments(parser):
 
 
 def apply_defaults(args):
+    if getattr(args, "probe_erase_budget", False):
+        return
     if (args.read_eeprom or args.read_eps_faults or args.read_eps_motion
             or args.read_eps_assist or args.read_eps_supply or args.read_eps_can_config):
         return
@@ -370,6 +372,10 @@ def validate_cli(parser, args):
                 or args.readout_window != 0x10000 or args.readout_method != "auto"):
             parser.error("--read-eeprom cannot be combined with flash or CPU-readout options")
         return
+    if getattr(args, "probe_erase_budget", False):
+        if args.input or args.readout:
+            parser.error("--probe-erase-budget cannot be combined with flash or readout options")
+        return
     if args.ident_only:
         if args.input or args.dry_run:
             parser.error("--ident-only cannot be combined with flash or dry-run options")
@@ -415,6 +421,151 @@ def run_flash(args, runtime):
     )
     result = flasher.flash_prepared(prepared, recovery=args.recovery)
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _safe_disconnect(tp):
+    try:
+        tp.disconnect()
+    except Exception:
+        pass
+
+
+# Ascending erase windows drawn from the loader's RequestDownload table. Each is
+# an EXACT partition the loader accepts for 34/31 C4 (sub-ranges are rejected).
+PROBE_WINDOWS = (
+    ("dataset_4k_5D000", 0x5D000, 0x5DFFF),           # known-good: must SURVIVE (sanity)
+    ("dataset_36k_57000", 0x57000, 0x5FFFF),          # 0x9000
+    ("dataset_36k_57000_reerase", 0x57000, 0x5FFFF),  # 2nd pass over the now-blank region
+    ("app_min_A000_5BFFF", 0x0A000, 0x5BFFF),         # smallest application window (0x52000)
+)
+
+
+def run_probe(args, runtime):
+    """EPS loader recovery diagnostic: find the largest single erase that
+    completes WITHOUT resetting the loader's programming STATE.
+
+    Per window: unlock, 34 RequestDownload, 31 C4 erase (expect 71 C4 01), then
+    stay SILENT through the erase/deaf window, reconnect ONCE, and send ONLY
+    33 C4. 73 C4 00 => STATE survived (no reset); NRC 0x33 => the erase forced a
+    reset and STATE was lost (security gate). No data is ever written. The flash
+    attempt counter is 8-bit with no lockout (EPSRe notes/BOOT_2901_counters.md),
+    so repeated erases are safe. A 27 is never re-sent after the erase because the
+    key-accept path itself clears STATE.
+    """
+    plan = {
+        "operation": "probe_erase_budget", "module": args.module,
+        "windows": [{"name": n, "start": f"0x{s:05X}", "end": f"0x{e:05X}", "size": e - s + 1}
+                    for n, s, e in PROBE_WINDOWS],
+        "silent_wait_s": args.probe_wait_s, "reconnect_tries": args.probe_reconnect_tries,
+        "firmware_writes": False, "destructive_erase": True,
+    }
+    if args.dry_run:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        print("No CAN traffic sent.")
+        return 0
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    if not args.yes and input(
+            "Type YES to run the destructive EPS erase-budget probe: ") != "YES":
+        print("Cancelled before adapter access.")
+        return 1
+
+    device = runtime.open_adapter(args)
+
+    def make_tp():
+        try:
+            device.can_clear(0xFFFF)
+        except Exception:
+            pass
+        tp = TP20Transport(device, module=args.module, timeout=2.0,
+                           debug=args.verbose, legacy_ack=True)
+        return tp, EPSKWPClient(tp)
+
+    results = []
+    try:
+        tp, kwp = make_tp()
+        info = decorate_identification(parse_vag_identification(
+            kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C)))
+        if not info.get("in_bootloader"):
+            raise RuntimeError(
+                f"EPS is not in its resident loader (system_desc={info.get('system_desc')!r}); "
+                "the probe only runs against the bootloader")
+        _safe_disconnect(tp)
+
+        for name, start, end in PROBE_WINDOWS:
+            size = end - start + 1
+            step = {"name": name, "start": f"0x{start:05X}", "end": f"0x{end:05X}", "size": size}
+            try:
+                tp, kwp = make_tp()
+                EPS_PROGRAMMING_SECURITY.unlock(kwp)
+                kwp.request_download(start, size)            # 34
+                kwp.routine(RC_ERASE, a3(start) + a3(end))   # 31 C4 -> 71 C4 01
+                step["erase_accepted"] = True
+            except KWPNegativeResponse as nr:
+                step.update(erase_accepted=False, erase_nrc=f"0x{nr.code:02X}",
+                            verdict=f"erase rejected (NRC 0x{nr.code:02X})")
+                results.append(step)
+                _safe_disconnect(tp)
+                continue
+            except Exception as exc:
+                step.update(erase_accepted=False, error=f"{type(exc).__name__}: {exc}",
+                            verdict="erase step errored")
+                results.append(step)
+                _safe_disconnect(tp)
+                continue
+
+            _safe_disconnect(tp)
+            time.sleep(args.probe_wait_s)  # SILENCE through erase + deaf window
+
+            started = time.monotonic()
+            reconnected = False
+            for _ in range(args.probe_reconnect_tries):
+                try:
+                    tp, kwp = make_tp()
+                    reconnected = True
+                    break
+                except Exception:
+                    time.sleep(1.0)
+            step["reconnect_s"] = round(time.monotonic() - started, 1)
+            step["reconnected"] = reconnected
+            if not reconnected:
+                step["verdict"] = "no reconnect (still deaf past budget, or hung)"
+                results.append(step)
+                continue
+            try:
+                resp = kwp.routine_result(RC_ERASE)          # 33 C4, no 27 first
+                step.update(routine_result=resp.hex(), state_survived=True,
+                            verdict="SURVIVED - STATE intact after erase (73 C4 00)")
+            except KWPNegativeResponse as nr:
+                step["result_nrc"] = f"0x{nr.code:02X}"
+                if nr.code == 0x33:
+                    step.update(state_survived=False,
+                                verdict="RESET - STATE lost, security gate (0x33): erase over budget")
+                elif nr.code == 0x23:
+                    step.update(state_survived=True,
+                                verdict="SURVIVED - erase still pending (0x23); raise --probe-wait-s")
+                elif nr.code == 0x22:
+                    step.update(state_survived=False,
+                                verdict="STATE present but not 6 (0x22) - inspect sequence")
+                else:
+                    step["verdict"] = f"unexpected NRC 0x{nr.code:02X}"
+            except Exception as exc:
+                step.update(result_error=f"{type(exc).__name__}: {exc}", verdict="33 C4 errored")
+            results.append(step)
+            _safe_disconnect(tp)
+    finally:
+        try:
+            device.close()
+        except Exception:
+            pass
+
+    survived = [r["name"] for r in results if r.get("state_survived")]
+    report = dict(plan, results=results, survived_windows=survived, interpretation=(
+        "Largest SURVIVED window = the single-erase budget. If app_min_A000_5BFFF survived, the full "
+        "app flashes in one window (then 36 transferData + 37 + checksum). If it reset but dataset_36k "
+        "survived, use the two-pass route (let the first erase reset, then re-erase the now-blank "
+        "region). Attempt counter has no lockout, so iterate freely."))
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 

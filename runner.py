@@ -189,6 +189,14 @@ def build_parser(family=None):
                         help="Number of stationary EPS CAN-config samples (default 1, maximum 200)")
     parser.add_argument("--can-config-interval-ms", type=int, default=100,
                         help="Minimum interval between EPS CAN-config samples (default 100 ms)")
+    parser.add_argument("--probe-erase-budget", action="store_true",
+                        help="EPS loader recovery diagnostic: erase ascending flash windows and report the "
+                             "largest single 31 C4 that completes without a reset (STATE survives -> 33 C4 ok). "
+                             "Destructive erases; intended for an already-bootloadered rack.")
+    parser.add_argument("--probe-wait-s", type=float, default=10.0,
+                        help="Silent wait after 71 C4 01 before reconnecting during --probe-erase-budget")
+    parser.add_argument("--probe-reconnect-tries", type=int, default=20,
+                        help="Reconnect attempts (1s apart) after the erase during --probe-erase-budget")
     parser.add_argument("--out")
     parser.add_argument("--reference")
     parser.add_argument("--readout-passes", type=int, choices=(1, 2), default=1)
@@ -238,6 +246,8 @@ def _operation(args):
         return "backup"
     if getattr(args, "bcm_preconditions", False):
         return "preconditions"
+    if getattr(args, "probe_erase_budget", False):
+        return "probe"
     if args.readout:
         return "readout"
     return "flash"
@@ -320,8 +330,8 @@ def main(argv=None):
     if sum((args.ident_only, args.readout, args.read_eeprom, args.read_eps_faults,
             args.read_eps_motion, args.read_eps_assist, args.read_eps_supply,
             args.read_eps_can_config, args.read_bcm_pageff, getattr(args, "bcm_backup", False),
-            getattr(args, "bcm_preconditions", False))) > 1:
-        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup and preconditions operations cannot be combined")
+            getattr(args, "bcm_preconditions", False), getattr(args, "probe_erase_budget", False))) > 1:
+        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup, preconditions and probe operations cannot be combined")
     operation = _operation(args)
     if operation != "motion" and (args.motion_samples != 1 or args.motion_interval_ms != 100):
         parser.error("--motion-samples and --motion-interval-ms require --read-eps-motion")
