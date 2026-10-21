@@ -29,6 +29,16 @@ READ_SEND_KEY = 0x04
 READ_KEY_ADD = 0x1596
 MAX_READ_MEMORY_BLOCK = 0xF0
 SESSION_PROGRAMMING = 0x85
+# The resident loader's erase is blocking: a 31 C4 over the application
+# (anything below 0x5C000, smallest region 0x0A000..0x5BFFF) stalls TP2 until the
+# channel drops, and the new channel resets its programming state. The erase
+# still completes, so a running rack is left erased in its loader. Seen on every
+# bench attempt; EPSRe notes/BOOT_2901_flash.md. Only 0x5C000.. blocks flash.
+APPLICATION_END = 0x5C000
+APPLICATION_ERASE_BLOCKED = (
+    "PQ EPS flashes that include the application (below 0x5C000) are disabled: the "
+    "loader's blocking erase drops the channel and resets its programming state, so "
+    "the flash fails and leaves the application erased. Only --recovery may try it.")
 RC_ERASE = 0xC4
 RC_CHECKSUM = 0xC5
 CHUNK_SIZE = 240
@@ -277,11 +287,6 @@ def add_cli_arguments(parser):
         help=f"27 03/04 additive constant (default 0x{READ_KEY_ADD:04X})")
     parser.add_argument("--correct-checksum", action="store_true",
                         help="Accept an input image with wrong dataset CRCs and recalculate them")
-    parser.add_argument(
-        "--eps-preerased", action="store_true",
-        help="Recovery only: the full range is already blank (an interrupted full flash "
-             "erased it); request the download twice so the loader skips the physical "
-             "erase, then write and checksum the range")
 
 
 def apply_defaults(args):
@@ -381,9 +386,8 @@ def validate_cli(parser, args):
     if not args.input:
         parser.error("--input is required unless --readout or --ident-only is selected")
     validate_selection(args.start, args.end)
-    if args.eps_preerased and not (args.recovery and (args.start, args.end) == (
-            FLASH_START, EPS_IMAGE_SIZE - 1)):
-        parser.error("--eps-preerased needs --recovery and the full range 0x0A000..0x5FFFF")
+    if args.start < APPLICATION_END and not args.recovery:
+        parser.error(APPLICATION_ERASE_BLOCKED)
 
 
 def run_flash(args, runtime):
@@ -409,8 +413,6 @@ def run_flash(args, runtime):
         device_factory=lambda: runtime.open_adapter(args),
         progress_cb=runtime.progress, debug=args.verbose,
     )
-    if args.eps_preerased:
-        prepared["metadata"]["preerased"] = True
     result = flasher.flash_prepared(prepared, recovery=args.recovery)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
