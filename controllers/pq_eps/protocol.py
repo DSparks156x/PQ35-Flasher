@@ -216,6 +216,7 @@ def make_eps_flash_profile(*, kwp_factory, image_preparer, device_factory,
         validate_fresh_application=validate_application,
         commit_services=(0x82,),
         programming_reconnect_delay=1.0,
+        resecure_after_reconnect=True,
     )
 
 
@@ -234,7 +235,8 @@ class PQEPSFlasher(PQFlasher):
             image_preparer=lambda *args, **kwargs: prepare_image(*args, **kwargs),
             device_factory=lambda selected_channel: SocketCANDevice(
                 channel=selected_channel, interface=interface),
-            transport_factory=lambda *args, **kwargs: TP20Transport(*args, **kwargs),
+            transport_factory=lambda *args, **kwargs: TP20Transport(
+                *args, legacy_ack=True, **kwargs),
             identify=lambda kwp, tp: self._ident(kwp, tp),
         )
         super().__init__(profile, channel=channel, module=module, device=device,
