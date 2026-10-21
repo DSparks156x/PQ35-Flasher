@@ -216,37 +216,7 @@ def make_eps_flash_profile(*, kwp_factory, image_preparer, device_factory,
         validate_fresh_application=validate_application,
         commit_services=(0x82,),
         programming_reconnect_delay=1.0,
-        # The loader's RequestDownload only follows a fresh 27 02 (STATE 3), and
-        # every sector ends in STATE 8/9 (EPSRe notes/BOOT_2901_flash.md).
-        unlock_per_segment=True,
     )
-
-
-SECTOR_SIZE = 0x1000
-
-
-def sector_segments(prepared: dict) -> list:
-    """Split a prepared EPS range into 4 KiB sectors, each with its own checksum.
-
-    The resident loader's erase is blocking: a whole-application 31 C4 stalls
-    TP2 until the channel drops, and a dropped channel resets the loader's
-    programming state, so a large erase can never be completed. Each 4 KiB
-    sector erases before the channel times out, the size the 0x5D/0x5E flashes
-    already use.
-    """
-    metadata = prepared["metadata"]
-    start, end, region = metadata["start_addr"], metadata["end_addr"], prepared["region"]
-    if end - start + 1 <= SECTOR_SIZE:
-        return [prepared]
-    if start % SECTOR_SIZE or (end + 1) % SECTOR_SIZE:
-        raise ValueError("A multi-sector PQ EPS flash must start and end on 4 KiB boundaries")
-    segments = []
-    for offset in range(0, len(region), SECTOR_SIZE):
-        block = region[offset:offset + SECTOR_SIZE]
-        segments.append({"region": block, "metadata": dict(
-            metadata, start_addr=start + offset, end_addr=start + offset + len(block) - 1,
-            size=len(block), checksum=sum(block) & 0xFFFF)})
-    return segments
 
 
 class PQEPSFlasher(PQFlasher):
@@ -271,11 +241,6 @@ class PQEPSFlasher(PQFlasher):
         super().__init__(profile, channel=channel, module=module, device=device,
                          device_factory=device_factory, progress_cb=progress_cb,
                          log_cb=log_cb, debug=debug)
-
-    def flash_prepared(self, prepared: dict, *, recovery=False):
-        """Flash ranges larger than 4 KiB sector by sector in one session."""
-        return self.flash_segments(sector_segments(prepared), recovery=recovery,
-                                   metadata=prepared["metadata"])
 
     @staticmethod
     def prepare_image(source, start_addr=DEFAULT_START, end_addr=DEFAULT_END,
@@ -312,6 +277,11 @@ def add_cli_arguments(parser):
         help=f"27 03/04 additive constant (default 0x{READ_KEY_ADD:04X})")
     parser.add_argument("--correct-checksum", action="store_true",
                         help="Accept an input image with wrong dataset CRCs and recalculate them")
+    parser.add_argument(
+        "--eps-preerased", action="store_true",
+        help="Recovery only: the full range is already blank (an interrupted full flash "
+             "erased it); request the download twice so the loader skips the physical "
+             "erase, then write and checksum the range")
 
 
 def apply_defaults(args):
@@ -411,6 +381,9 @@ def validate_cli(parser, args):
     if not args.input:
         parser.error("--input is required unless --readout or --ident-only is selected")
     validate_selection(args.start, args.end)
+    if args.eps_preerased and not (args.recovery and (args.start, args.end) == (
+            FLASH_START, EPS_IMAGE_SIZE - 1)):
+        parser.error("--eps-preerased needs --recovery and the full range 0x0A000..0x5FFFF")
 
 
 def run_flash(args, runtime):
@@ -436,6 +409,8 @@ def run_flash(args, runtime):
         device_factory=lambda: runtime.open_adapter(args),
         progress_cb=runtime.progress, debug=args.verbose,
     )
+    if args.eps_preerased:
+        prepared["metadata"]["preerased"] = True
     result = flasher.flash_prepared(prepared, recovery=args.recovery)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

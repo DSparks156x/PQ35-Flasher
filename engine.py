@@ -85,9 +85,6 @@ class PQFlashProfile:
     validate_fresh_application: Callable[[dict], None]
     commit_services: Tuple[int, ...] = (0x20, 0x82)
     programming_reconnect_delay: float = 0.0
-    # Unlock programming security again before every segment after the first:
-    # a loader whose RequestDownload only follows a fresh SendKey needs it.
-    unlock_per_segment: bool = False
 
 
 def parse_vag_flash_date(raw: bytes) -> Optional[str]:
@@ -649,6 +646,16 @@ class PQFlasher:
         span = max(progress_hi - progress_lo, 1)
         self._cancel()
         limit = kwp.request_download(start_addr, metadata["size"])
+        if metadata.get("preerased"):
+            # The range is already blank. A second RequestDownload in the same
+            # session (after a fresh unlock) makes the PQ EPS loader skip the
+            # physical erase in its erase routine, which otherwise blocks long
+            # enough to drop the channel.
+            self.log("PRE-ERASED: unlocking and requesting the download again so the "
+                     "erase routine skips the physical erase")
+            if self.profile.programming_security is not None:
+                self.profile.programming_security.unlock(kwp)
+            limit = kwp.request_download(start_addr, metadata["size"])
         chunk = (min(self.profile.chunk_size, limit - 1) // 4) * 4
         if chunk < 4:
             raise RuntimeError("Controller transfer size is too small")
@@ -723,9 +730,6 @@ class PQFlasher:
                 self.log(f"SEGMENT {index + 1}/{count} "
                          f"0x{segment['metadata']['start_addr']:06X}.."
                          f"0x{segment['metadata']['end_addr']:06X}")
-                if (index and self.profile.unlock_per_segment
-                        and self.profile.programming_security is not None):
-                    self.profile.programming_security.unlock(kwp)
                 kwp = self._program_segment(kwp, segment, progress_lo=seg_lo, progress_hi=seg_hi)
             self.last_result["checksum_verified"] = True
             self.report_progress("REBOOTING", 96, "Committing; fresh application verification required")
