@@ -84,8 +84,8 @@ class FakeTransport:
         pass
 
 
-class PreerasedFlashTests(unittest.TestCase):
-    def flash(self, segment):
+class SingleBlockFlashTests(unittest.TestCase):
+    def test_block_flash_requests_the_download_once(self):
         calls = []
         flasher = PQEPSFlasher(device=FakeDevice())
         flasher.profile = dataclasses.replace(
@@ -97,48 +97,42 @@ class PreerasedFlashTests(unittest.TestCase):
                                       "flash_status": 0})
         flasher.reconnect_tp = lambda *a, **k: FakeTransport()
         with patch.object(engine.time, "sleep"):
-            result = flasher.flash_prepared(segment, recovery=True)
-        return [c for c in calls if c != ("36",)], result
-
-    def test_preerased_requests_the_download_twice_before_the_erase(self):
-        calls, result = self.flash(prepared(0x0A000, 0x5FFFF, preerased=True))
-        self.assertEqual(calls, [
-            ("verify",), ("27",), ("34", 0x0A000, 0x56000), ("27",), ("34", 0x0A000, 0x56000),
-            ("31", 0xC4), ("33", 0xC4), ("37",), ("31", 0xC5), ("33", 0xC5), ("82",)])
-        self.assertEqual(result["status"], "ok")
-        self.assertTrue(result["preerased"])
-
-    def test_normal_flash_requests_the_download_once(self):
-        calls, _ = self.flash(prepared(0x5D000, 0x5DFFF))
-        self.assertEqual(calls, [
+            flasher.flash_prepared(prepared(0x5D000, 0x5DFFF), recovery=True)
+        self.assertEqual([c for c in calls if c != ("36",)], [
             ("verify",), ("27",), ("34", 0x5D000, 0x1000), ("31", 0xC4), ("33", 0xC4),
             ("37",), ("31", 0xC5), ("33", 0xC5), ("82",)])
 
 
-class PreerasedCliTests(unittest.TestCase):
+class ApplicationFlashBlockedTests(unittest.TestCase):
     def args(self, **values):
         defaults = dict(correct_checksum=False, read_eps_can_config=False, read_eps_supply=False,
                         read_eps_assist=False, read_eps_motion=False, read_eps_faults=False,
                         read_eeprom=False, ident_only=False, readout=False, input="rack.bin",
-                        start=0x0A000, end=0x5FFFF, recovery=True, eps_preerased=True)
+                        start=0x0A000, end=0x5FFFF, recovery=False)
         defaults.update(values)
         return argparse.Namespace(**defaults)
 
     def check(self, **values):
         parser = argparse.ArgumentParser()
-        with contextlib.redirect_stderr(io.StringIO()):
-            protocol.validate_cli(parser, self.args(**values))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                protocol.validate_cli(parser, self.args(**values))
+            except SystemExit:
+                return err.getvalue()
+        return None
 
-    def test_preerased_needs_recovery(self):
-        with self.assertRaises(SystemExit):
-            self.check(recovery=False)
+    def test_full_flash_is_refused(self):
+        self.assertIn("disabled", self.check())
 
-    def test_preerased_needs_the_full_range(self):
-        with self.assertRaises(SystemExit):
-            self.check(start=0x5D000, end=0x5DFFF)
+    def test_application_only_range_is_refused(self):
+        self.assertIn("disabled", self.check(end=0x5BFFF))
 
-    def test_preerased_full_recovery_is_accepted(self):
-        self.check()
+    def test_recovery_may_still_try(self):
+        self.assertIsNone(self.check(recovery=True))
+
+    def test_block_flashes_are_unaffected(self):
+        for start, end in ((0x5C000, 0x5DFFF), (0x5D000, 0x5DFFF), (0x5E000, 0x5EFFF)):
+            self.assertIsNone(self.check(start=start, end=end))
 
 
 class EpsProfileTests(unittest.TestCase):

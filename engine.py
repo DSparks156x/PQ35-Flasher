@@ -646,16 +646,6 @@ class PQFlasher:
         span = max(progress_hi - progress_lo, 1)
         self._cancel()
         limit = kwp.request_download(start_addr, metadata["size"])
-        if metadata.get("preerased"):
-            # The range is already blank. A second RequestDownload in the same
-            # session (after a fresh unlock) makes the PQ EPS loader skip the
-            # physical erase in its erase routine, which otherwise blocks long
-            # enough to drop the channel.
-            self.log("PRE-ERASED: unlocking and requesting the download again so the "
-                     "erase routine skips the physical erase")
-            if self.profile.programming_security is not None:
-                self.profile.programming_security.unlock(kwp)
-            limit = kwp.request_download(start_addr, metadata["size"])
         chunk = (min(self.profile.chunk_size, limit - 1) // 4) * 4
         if chunk < 4:
             raise RuntimeError("Controller transfer size is too small")
