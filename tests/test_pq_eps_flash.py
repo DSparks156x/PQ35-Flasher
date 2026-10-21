@@ -24,60 +24,46 @@ if "flasher" not in sys.modules:
         spec.loader.exec_module(module)
 
 from flasher import engine
-from flasher.controllers.pq_eps.protocol import PQEPSFlasher
+from flasher.controllers.pq_eps.protocol import PQEPSFlasher, SECTOR_SIZE, sector_segments
 
 
-class FakeKWP:
-    """Routine-result polling against a loader that forgets security on a new channel."""
-
-    def __init__(self, loader, lose_channel=False):
-        self.loader = loader
-        self.lose_channel = lose_channel
-
-    def routine_result(self, routine):
-        self.loader.calls.append(("poll", routine))
-        if self.lose_channel:
-            self.lose_channel = False
-            raise ConnectionError("Controller closed TP2 channel while waiting for ACK")
-        if not self.loader.unlocked:
-            raise RuntimeError("Negative response to RoutineResults (0xC4): NRC 0x33 "
-                               "(SecurityAccessDenied)")
-        return bytes([0x73, routine, 0])
-
-
-class SegmentKWP:
-    """Records which channel each step of a segment flash went out on."""
-
-    def __init__(self, loader, name):
-        self.loader, self.name = loader, name
-
-    def request_download(self, start, size):
-        self.loader.calls.append((self.name, "download"))
-        return 0xF2
-
-    def routine(self, routine, payload):
-        self.loader.calls.append((self.name, "routine", routine))
-
-    def routine_result(self, routine):
-        self.loader.calls.append((self.name, "poll", routine))
-        return bytes([0x73, routine, 0])
-
-    def transfer(self, block):
-        self.loader.calls.append((self.name, "transfer"))
-
-    def transfer_exit(self):
-        self.loader.calls.append((self.name, "exit"))
+def prepared(start, end):
+    region = bytes((i * 7) & 0xFF for i in range(end - start + 1))
+    return {"region": region, "metadata": {
+        "start_addr": start, "end_addr": end, "size": len(region),
+        "checksum": sum(region) & 0xFFFF}}
 
 
 class FakeLoader:
+    """Records every request a flash sends, in order."""
+
     def __init__(self):
         self.calls = []
-        self.unlocked = True
 
-    def reconnect(self, *args, **kwargs):
-        self.calls.append(("reconnect",))
-        self.unlocked = False  # a fresh TP2 channel starts locked
-        return object()
+
+class FakeKWP:
+    def __init__(self, loader):
+        self.loader = loader
+
+    def request_download(self, start, size):
+        self.loader.calls.append(("34", start, size))
+        return 0xF2
+
+    def routine(self, routine, payload):
+        self.loader.calls.append(("31", routine, payload.hex()))
+
+    def routine_result(self, routine):
+        self.loader.calls.append(("33", routine))
+        return bytes([0x73, routine, 0])
+
+    def transfer(self, block):
+        self.loader.calls.append(("36", len(block)))
+
+    def transfer_exit(self):
+        self.loader.calls.append(("37",))
+
+    def raw(self, request):
+        self.loader.calls.append((request.hex(),))
 
 
 class FakeSecurity:
@@ -85,86 +71,90 @@ class FakeSecurity:
         self.loader = loader
 
     def unlock(self, kwp):
-        self.loader.calls.append(("unlock",))
-        self.loader.unlocked = True
+        self.loader.calls.append(("27",))
 
 
-class EpsRoutineReconnectTests(unittest.TestCase):
-    def flasher(self, loader, resecure=True):
-        flasher = PQEPSFlasher(device=object())
+class FakeDevice:
+    def close(self):
+        pass
+
+
+class FakeTransport:
+    keepalive_after_response = False
+
+    def disconnect(self):
+        pass
+
+
+class SectorSplitTests(unittest.TestCase):
+    def test_full_range_splits_into_4k_sectors_with_own_checksums(self):
+        whole = prepared(0x0A000, 0x5FFFF)
+        segments = sector_segments(whole)
+        self.assertEqual(len(segments), 0x56000 // SECTOR_SIZE)
+        self.assertEqual(b"".join(s["region"] for s in segments), whole["region"])
+        for index, segment in enumerate(segments):
+            meta = segment["metadata"]
+            self.assertEqual(meta["start_addr"], 0x0A000 + index * SECTOR_SIZE)
+            self.assertEqual(meta["end_addr"], meta["start_addr"] + SECTOR_SIZE - 1)
+            self.assertEqual(meta["size"], SECTOR_SIZE)
+            self.assertEqual(meta["checksum"], sum(segment["region"]) & 0xFFFF)
+
+    def test_single_block_is_left_alone(self):
+        block = prepared(0x5D000, 0x5DFFF)
+        self.assertEqual(sector_segments(block), [block])
+
+    def test_unaligned_multi_sector_range_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "4 KiB boundaries"):
+            sector_segments(prepared(0x0A000, 0x0B7FF))
+
+
+class SectorFlashTests(unittest.TestCase):
+    def flasher(self, loader):
+        flasher = PQEPSFlasher(device=FakeDevice())
         flasher.profile = dataclasses.replace(
             flasher.profile,
             kwp_factory=lambda tp, log, debug: FakeKWP(loader),
             verify_programming_channel=lambda tp: loader.calls.append(("verify",)),
             programming_security=FakeSecurity(loader),
-            resecure_after_reconnect=resecure)
-
-        def reconnect(*args, **kwargs):  # like PQFlasher.reconnect_tp, keeps the channel
-            flasher._tp = loader.reconnect()
-            return flasher._tp
-
-        flasher.reconnect_tp = reconnect
-        flasher._tp = object()
+            identify=lambda kwp, tp: {"sw_version": "3305", "part_number": "8J0909144P",
+                                      "flash_status": 0})
+        flasher.reconnect_tp = lambda *a, **k: FakeTransport()
         return flasher
 
-    def test_channel_lost_while_polling_is_resecured(self):
+    @staticmethod
+    def sector(start):
+        """The proven 0x5D/0x5E ladder for one sector, up to TransferExit."""
+        end = start + SECTOR_SIZE - 1
+        full, rest = divmod(SECTOR_SIZE, 240)
+        return ([("34", start, SECTOR_SIZE), ("31", 0xC4, f"{start:06x}{end:06x}"), ("33", 0xC4)]
+                + [("36", 240)] * full + ([("36", rest)] if rest else []) + [("37",)])
+
+    def test_each_sector_runs_the_full_ladder_after_a_fresh_unlock(self):
+        loader = FakeLoader()
+        whole = prepared(0x0A000, 0x0BFFF)
+        with patch.object(engine.time, "sleep"):
+            result = self.flasher(loader).flash_prepared(whole, recovery=True)
+        checksums = [sum(whole["region"][o:o + SECTOR_SIZE]) & 0xFFFF for o in (0, SECTOR_SIZE)]
+        self.assertEqual(loader.calls, (
+            [("verify",), ("27",)]
+            + self.sector(0x0A000) + [("31", 0xC5, f"00a00000afff{checksums[0]:04x}"), ("33", 0xC5)]
+            + [("27",)]
+            + self.sector(0x0B000) + [("31", 0xC5, f"00b00000bfff{checksums[1]:04x}"), ("33", 0xC5)]
+            + [("82",)]))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual((result["start_addr"], result["end_addr"]), (0x0A000, 0x0BFFF))
+        self.assertEqual(len(result["segments"]), 2)
+
+    def test_single_block_flash_is_unchanged(self):
         loader = FakeLoader()
         with patch.object(engine.time, "sleep"):
-            self.flasher(loader)._routine_done(FakeKWP(loader, lose_channel=True), 0xC4)
-        self.assertEqual(loader.calls, [("poll", 0xC4), ("reconnect",), ("verify",),
-                                        ("unlock",), ("poll", 0xC4)])
+            self.flasher(loader).flash_prepared(prepared(0x5D000, 0x5DFFF), recovery=True)
+        self.assertEqual(loader.calls.count(("27",)), 1)
+        self.assertEqual(loader.calls.count(("34", 0x5D000, SECTOR_SIZE)), 1)
 
-    def test_without_resecure_a_fresh_channel_is_denied(self):
-        loader = FakeLoader()
-        with patch.object(engine.time, "sleep"), self.assertRaisesRegex(RuntimeError, "0x33"):
-            self.flasher(loader, resecure=False)._routine_done(
-                FakeKWP(loader, lose_channel=True), 0xC4)
-
-    def test_denied_after_planned_reconnect_resecures_once(self):
-        loader = FakeLoader()
-        loader.unlocked = False
-        with patch.object(engine.time, "sleep"):
-            self.flasher(loader)._routine_done(FakeKWP(loader), 0xC4, reconnected=True)
-        self.assertEqual(loader.calls, [("poll", 0xC4), ("verify",), ("unlock",), ("poll", 0xC4)])
-
-    def test_erase_abandons_the_channel_then_polls_on_a_fresh_one(self):
-        loader = FakeLoader()
-        old = SegmentKWP(loader, "old")
-        flasher = self.flasher(loader)
-        flasher.profile = dataclasses.replace(
-            flasher.profile, kwp_factory=lambda tp, log, debug: SegmentKWP(loader, "new"))
-        flasher.reconnect_tp = lambda *a, **k: (loader.calls.append(("reconnect",)), object())[1]
-        flasher._tp = "old channel"
-        region = bytes(range(8)) * 0x400  # 8 KiB: more than one block
-        segment = {"region": region, "metadata": {
-            "start_addr": 0x5C000, "end_addr": 0x5DFFF, "size": len(region), "checksum": sum(region)}}
-        with patch.object(engine.time, "sleep", lambda s: loader.calls.append(("sleep", s))):
-            flasher._program_segment(old, segment, progress_lo=25, progress_hi=92)
-        self.assertEqual(loader.calls[:5], [("old", "download"), ("old", "routine", 0xC4),
-                                            ("sleep", 1.0), ("reconnect",), ("new", "poll", 0xC4)])
-        self.assertNotIn(("old", "poll", 0xC4), loader.calls)
-        self.assertEqual(loader.calls[-2:], [("new", "routine", 0xC5), ("new", "poll", 0xC5)])
-
-    def test_4k_block_erase_keeps_polling_on_the_same_channel(self):
-        loader = FakeLoader()
-        flasher = self.flasher(loader)
-        flasher.profile = dataclasses.replace(
-            flasher.profile, kwp_factory=lambda tp, log, debug: SegmentKWP(loader, "new"))
-        region = bytes(0x1000)
-        segment = {"region": region, "metadata": {
-            "start_addr": 0x5D000, "end_addr": 0x5DFFF, "size": len(region), "checksum": 0}}
-        with patch.object(engine.time, "sleep"):
-            flasher._program_segment(SegmentKWP(loader, "old"), segment, progress_lo=25, progress_hi=92)
-        self.assertEqual(loader.calls[:3], [("old", "download"), ("old", "routine", 0xC4),
-                                            ("old", "poll", 0xC4)])
-        self.assertNotIn(("reconnect",), loader.calls)
-
-    def test_eps_profile_resecures_and_uses_legacy_acks(self):
+    def test_eps_profile_unlocks_per_segment_and_uses_legacy_acks(self):
         profile = PQEPSFlasher(device=object()).profile
-        self.assertTrue(profile.resecure_after_reconnect)
-        self.assertTrue(profile.reconnect_after_erase(0x0A000, 0x5FFFF))
-        self.assertFalse(profile.reconnect_after_erase(0x5D000, 0x5DFFF))
-        self.assertFalse(profile.reconnect_after_erase(0x5E000, 0x5EFFF))
+        self.assertTrue(profile.unlock_per_segment)
         transport = profile.transport_factory(object(), module=0x09, timeout=2.0,
                                               auto_open=False)
         self.assertTrue(transport.legacy_ack)
