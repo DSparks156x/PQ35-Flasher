@@ -302,6 +302,8 @@ def add_cli_arguments(parser):
 
 
 def apply_defaults(args):
+    if getattr(args, "commit", False):
+        return
     if getattr(args, "recovery_flash", False):
         if args.start is None:
             args.start = FLASH_START
@@ -389,6 +391,10 @@ def validate_cli(parser, args):
                 or args.reference or args.readout_passes != 1
                 or args.readout_window != 0x10000 or args.readout_method != "auto"):
             parser.error("--read-eeprom cannot be combined with flash or CPU-readout options")
+        return
+    if getattr(args, "commit", False):
+        if args.input or args.readout:
+            parser.error("--commit cannot be combined with flash or readout options")
         return
     if getattr(args, "recovery_flash", False):
         if not args.input:
@@ -726,6 +732,14 @@ def run_recoveryflash(args, runtime):
             raise RuntimeError(f"33 C5 unexpected: {resp.hex()}")
         if cres is None:
             raise RuntimeError("checksum verify did not complete (image checksum mismatch?)")
+        # Finalize: StopCommunication (0x82). The loader's 0x82 handler (STATE 3 ->
+        # 0x8D76) validates the app and writes its valid/"Ende" marker so it boots.
+        # Without this the flash verifies but the rack stays in the loader.
+        print("[82] finalize (StopCommunication / commit app)")
+        try:
+            kwp.request(b"\x82")
+        except Exception as exc:
+            print(f"  finalize unconfirmed (can be normal if it resets the ECU): {type(exc).__name__}")
         result["status"] = "flashed"
     except Exception as exc:
         result["status"] = "failed"
@@ -739,6 +753,54 @@ def run_recoveryflash(args, runtime):
             pass
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("status") == "flashed" else 1
+
+
+def run_commit(args, runtime):
+    """Finalize an already-written EPS app WITHOUT re-flashing: unlock (27) then
+    StopCommunication (0x82). The loader's 0x82 handler (STATE 3 -> 0x8D76)
+    validates the flashed app and writes its valid/"Ende" marker so it boots. Use
+    when a flash completed (33 C5 -> 73 C5 00) but the rack stayed in the loader
+    because the finalize was never sent. Does not erase or write any flash."""
+    device = runtime.open_adapter(args)
+    tp = kwp = None
+    result = {"operation": "commit_app", "module": args.module}
+    try:
+        tp = TP20Transport(device, module=args.module, timeout=2.0,
+                           debug=args.verbose, legacy_ack=True)
+        kwp = EPSKWPClient(tp)
+        info = decorate_identification(parse_vag_identification(
+            kwp.read_ecu_ident(0x9B), kwp.read_ecu_ident(0x9C)))
+        result["ecu_before"] = info
+        if not info.get("in_bootloader"):
+            result["status"] = "already_application"
+            print("EPS is already running the application (not in loader) — nothing to commit.")
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        print("[27] security unlock")
+        EPS_PROGRAMMING_SECURITY.unlock(kwp)
+        print("[82] StopCommunication — finalize/validate the written app")
+        try:
+            resp = kwp.request(b"\x82")
+            result["commit_response"] = resp.hex()
+        except Exception as exc:
+            # 0x82 may reset/close the channel as it commits; that is expected.
+            result["commit_response"] = f"no clean response (normal on finalize): {type(exc).__name__}: {exc}"
+        result["status"] = "commit_sent"
+    except Exception as exc:
+        result["status"] = "failed"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if tp is not None:
+            _safe_disconnect(tp)
+        try:
+            device.close()
+        except Exception:
+            pass
+    print(json.dumps(result, indent=2, sort_keys=True))
+    print("Now ignition-cycle the EPS and run --ident-only: it should boot the app "
+          "(in_bootloader false). If it still shows the loader, the flashed image lacks a "
+          "valid app signature and we inspect 0x8D76's validation.")
+    return 0 if result.get("status") in ("commit_sent", "already_application") else 1
 
 
 def run_readout(args, runtime):
