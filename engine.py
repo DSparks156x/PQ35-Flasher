@@ -85,13 +85,9 @@ class PQFlashProfile:
     validate_fresh_application: Callable[[dict], None]
     commit_services: Tuple[int, ...] = (0x20, 0x82)
     programming_reconnect_delay: float = 0.0
-    # A fresh TP2 channel opened while polling a routine starts without the
-    # programming security of the lost one; re-verify the loader and unlock it.
-    resecure_after_reconnect: bool = False
-    # (start, end) -> True when the loader drops the TP2 channel while it
-    # erases that range. Nothing more is sent on it; after a wait the erase is
-    # polled on a fresh channel (the sequence of pq-flasher's 03_flasher.py).
-    reconnect_after_erase: Optional[Callable[[int, int], bool]] = None
+    # Unlock programming security again before every segment after the first:
+    # a loader whose RequestDownload only follows a fresh SendKey needs it.
+    unlock_per_segment: bool = False
 
 
 def parse_vag_flash_date(raw: bytes) -> Optional[str]:
@@ -583,29 +579,7 @@ class PQFlasher:
                       if self.destructive_started else "")
             raise RuntimeError("Cancellation requested; operation stopped" + suffix)
 
-    def _resecure(self, kwp, routine):
-        self.log(f"[TP20] re-verifying the loader and programming security "
-                 f"before polling routine 0x{routine:02X} again")
-        self.profile.verify_programming_channel(self._tp)
-        if self.profile.programming_security is not None:
-            self.profile.programming_security.unlock(kwp)
-
-    def _reconnect_after_erase(self, routine, tries=10):
-        """Abandon the channel the loader drops while erasing, then reconnect."""
-        self.log(f"[TP20] routine 0x{routine:02X} started; the loader drops the channel "
-                 "while erasing, reconnecting")
-        self._tp = None  # nothing more is sent on it, not even A8
-        for attempt in range(tries):
-            self._cancel()
-            time.sleep(1.0)
-            try:
-                return self._new_kwp(self.reconnect_tp(1, heartbeat=True))
-            except Exception:
-                if attempt == tries - 1:
-                    raise
-
-    def _routine_done(self, kwp, routine, *, reconnected=False):
-        resecured = False
+    def _routine_done(self, kwp, routine):
         for _ in range(30):
             self._cancel()
             try:
@@ -617,17 +591,8 @@ class PQFlasher:
                     self._tp = None
                 time.sleep(0.5)
                 kwp = self._new_kwp(self.reconnect_tp(15, heartbeat=True))
-                reconnected = True
-                if self.profile.resecure_after_reconnect:
-                    self._resecure(kwp, routine)
-                    resecured = True
                 continue
             except RuntimeError as exc:
-                if ("NRC 0x33" in str(exc) and reconnected and not resecured
-                        and self.profile.resecure_after_reconnect):
-                    self._resecure(kwp, routine)
-                    resecured = True
-                    continue
                 if "NRC 0x23" not in str(exc):
                     raise
                 time.sleep(0.5)
@@ -692,12 +657,7 @@ class PQFlasher:
         self.report_progress("ERASING", progress_lo,
                              f"Erasing 0x{start_addr:06X}..0x{end_addr:06X}")
         kwp.routine(self.profile.erase_routine, erase_payload)
-        if (self.profile.reconnect_after_erase is not None
-                and self.profile.reconnect_after_erase(start_addr, end_addr)):
-            kwp = self._reconnect_after_erase(self.profile.erase_routine)
-            kwp = self._routine_done(kwp, self.profile.erase_routine, reconnected=True)
-        else:
-            kwp = self._routine_done(kwp, self.profile.erase_routine)
+        kwp = self._routine_done(kwp, self.profile.erase_routine)
         region = segment["region"]
         write_started = time.monotonic()
         for offset in range(0, len(region), chunk):
@@ -717,17 +677,19 @@ class PQFlasher:
         kwp = self._routine_done(kwp, self.profile.checksum_routine)
         return kwp
 
-    def flash_segments(self, segments, *, recovery=False):
+    def flash_segments(self, segments, *, recovery=False, metadata=None):
         """Flash one or more validated segments in a single programming session.
 
         Each segment is a prepared dict ({"region", "metadata"}); segments are
         programmed in order with their own download/erase/transfer/checksum
         cycle, then a single commit + fresh-application verification runs once.
-        A single-segment list is the classic whole-range flash.
+        A single-segment list is the classic whole-range flash. ``metadata``
+        describes the whole flash (controller validation and the result) when
+        the segments split one prepared range; it defaults to the first's.
         """
         if not segments:
             raise ValueError("flash_segments requires at least one segment")
-        metadata = dict(segments[0]["metadata"])
+        metadata = dict(metadata or segments[0]["metadata"])
         flash_date = system_flash_date()
         if flash_date is not None:
             metadata["flash_date"] = flash_date
@@ -761,6 +723,9 @@ class PQFlasher:
                 self.log(f"SEGMENT {index + 1}/{count} "
                          f"0x{segment['metadata']['start_addr']:06X}.."
                          f"0x{segment['metadata']['end_addr']:06X}")
+                if (index and self.profile.unlock_per_segment
+                        and self.profile.programming_security is not None):
+                    self.profile.programming_security.unlock(kwp)
                 kwp = self._program_segment(kwp, segment, progress_lo=seg_lo, progress_hi=seg_hi)
             self.last_result["checksum_verified"] = True
             self.report_progress("REBOOTING", 96, "Committing; fresh application verification required")
