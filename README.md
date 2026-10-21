@@ -217,11 +217,14 @@ python -m flasher.runner --module eps --input steer_dataset_4k.bin
 
 0x5E steer datasets are for >3000 firmware versions. the first step if you have <3000 firmware is to well, full firmware flash. I think. need to double check the converted SGO binaries actually contain that range. 
 
-Anything larger than one 4 KiB block is flashed sector by sector in one session:
-`27 01/02 → 34 → 31 C4 → 33 C4 → 36… → 37 → 31/33 C5` for each 4 KiB sector. The
-loader's erase is blocking, so one whole-range `31 C4` stalls TP2.0 until the channel
-drops, and a dropped channel resets the loader's programming state. See
-`EPSRe/notes/BOOT_2901_flash.md`.
+The resident loader only accepts the download regions in its flash table: below
+0x5C000 the smallest is 0x0A000..0x5BFFF, and a 4 KiB application sector gets NRC 0x43.
+Its erase is blocking, so a whole-application `31 C4` stalls TP2.0 until the channel
+drops, and a dropped channel resets the loader's programming state (see
+`EPSRe/notes/BOOT_2901_flash.md`). The erase itself still completes. To recover a rack
+left in its loader that way, `--recovery --eps-preerased` writes the full range
+without erasing again: it requests the download twice in one session, so the
+loader's erase routine skips the physical erase, then writes and checksums the range.
 
 ### EPS patches
 
