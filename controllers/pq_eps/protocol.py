@@ -217,6 +217,9 @@ def make_eps_flash_profile(*, kwp_factory, image_preparer, device_factory,
         commit_services=(0x82,),
         programming_reconnect_delay=1.0,
         resecure_after_reconnect=True,
+        # Full-range erases drop the channel (seen at 0x0A000..0x5FFFF). Single
+        # 4 KiB blocks keep polling on the same channel, as they always have.
+        reconnect_after_erase=lambda start, end: end - start + 1 > 0x1000,
     )
 
 
