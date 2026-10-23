@@ -251,9 +251,9 @@ Available patches:
 | `hca-gain-140`, `hca-gain-160`, `--gains` | HCA speed-gain tables (Q7, 128 = 1.0x) | 0x5E | 3001 (`8J0909144J`/`1K0909144J`), 3305, `1K0909144R` 3501, and gen3 4 KiB datasets |
 | `--torque-trip NM` | HCA overlay torque trip, the float at 0x5D09C (stock 3.8): the monitor trips when \|(HCA + DSR) / 68\| exceeds it. Only that word and the 0x5D CRC are written | 0x5D | 3001 (`8J0909144J`/`1K0909144J`), 3305, `1K0909144R` 3501 |
 
-The two slew patches are exclusive. HCA gains are capped at 160: at the largest
-HCA input, 160 gives 3.75 Nm against the rack's 3.8 Nm monitor, and tripping that
-monitor latches a fault until power is cycled.
+The two slew patches are exclusive. HCA gains go up to 255. With the stock 3.8 Nm
+torque trip, 160 is the most: at the largest HCA input it gives 3.75 Nm, and
+tripping latches a fault until power is cycled. Higher gains need a raised trip.
 
 
 **Read-only diagnostics.** None of these unlock programming, clear faults or

@@ -110,8 +110,11 @@ class EpsPatchTests(unittest.TestCase):
         self.assertTrue(crcs_valid(out))
 
     def test_gain_limits(self):
-        with self.assertRaisesRegex(ValueError, "0 to 160"):
-            P.apply_patches(tt3305(), [], [[161, 100, 100]] * 3)
+        with self.assertRaisesRegex(ValueError, "0 to 255"):
+            P.apply_patches(tt3305(), [], [[256, 100, 100]] * 3)
+        out = P.apply_patches(tt3305(), [], [[255, 200, 161]] * 3)
+        self.assertEqual(P.hca_gains(out), [[255, 200, 161]] * 3)
+        self.assertTrue(crcs_valid(out))
         with self.assertRaisesRegex(ValueError, "one HCA gain preset"):
             P.apply_patches(tt3305(), ["hca-gain-140"], [[100] * 3] * 3)
 
@@ -157,7 +160,8 @@ class EpsPatchTests(unittest.TestCase):
         self.assertEqual(by_feature[P.SLEW_20]["status"], "stock")
         self.assertEqual(by_feature[P.SLEW_20]["group"], [P.SLEW_20, P.SLEW_UP_10])
         self.assertEqual(options["gains"], STOCK_GAINS)
-        self.assertEqual(options["gain_max"], 160)
+        self.assertEqual(options["gain_max"], 255)
+        self.assertEqual(options["gain_max_stock_trip"], 160)
 
     def test_torque_trip(self):
         image = tt3305()

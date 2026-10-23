@@ -377,10 +377,12 @@ GAIN_POINTERS = 0x150
 GAIN_LUTS = (0x664, 0x66C, 0x674)
 GAIN_HEADER = bytes.fromhex("0300003278")
 GAIN_SPEEDS = (0, 50, 120)
-# At the largest accepted HCA input (204), gain 160 gives 255 counts (3.75 Nm),
-# just under the 3.8 Nm float monitor at 0x5D09C. Past it the rack latches a
-# fatal fault until power is cycled. No higher gain is known to be safe.
-GAIN_MAX = 160
+# Gains are a u8, so up to 255. At the largest accepted HCA input (204), gain 160
+# gives 255 counts (3.75 Nm), just under the stock 3.8 Nm torque trip at 0x5D09C;
+# past the trip the rack latches a fatal fault until power is cycled. Higher gains
+# need a raised trip, and no higher gain is known to be safe.
+GAIN_MAX = 255
+GAIN_MAX_STOCK_TRIP = 160
 GAIN_FIRMWARE = (
     _identity(0x5D7A0, "8J0909144J", "3001"),
     _identity(0x5D7A0, "1K0909144J", "3001"),
@@ -505,7 +507,8 @@ def patch_options(image: bytes) -> dict:
                          "manifest": name, "status": found.get(name) if name else None,
                          "group": next((sorted(g) for g in EXCLUSIVE if feature in g), None)})
     return {"features": features, "gains": hca_gains(image), "gain_speeds": list(GAIN_SPEEDS),
-            "gain_max": GAIN_MAX, "torque_trip": hca_torque_trip(image),
+            "gain_max": GAIN_MAX, "gain_max_stock_trip": GAIN_MAX_STOCK_TRIP,
+            "torque_trip": hca_torque_trip(image),
             "torque_trip_range": list(TORQUE_TRIP_RANGE)}
 
 
