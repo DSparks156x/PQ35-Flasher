@@ -249,6 +249,7 @@ Available patches:
 | `slew-up-10` | HCA torque rise step (0x5D0A4) 1 -> 10, matching the fall step | 0x5D | `8J0909144P`/`1K0909144P` 3305 |
 | `slew-20` | HCA rise and fall steps (0x5D0A4/0x5D0A6) 1/10 -> 20/20 | 0x5D | `8J0909144P`/`1K0909144P` 3305 |
 | `hca-gain-140`, `hca-gain-160`, `--gains` | HCA speed-gain tables (Q7, 128 = 1.0x) | 0x5E | 3001 (`8J0909144J`/`1K0909144J`), 3305, `1K0909144R` 3501, and gen3 4 KiB datasets |
+| `--torque-trip NM` | HCA overlay torque trip, the float at 0x5D09C (stock 3.8): the monitor trips when \|(HCA + DSR) / 68\| exceeds it. Only that word and the 0x5D CRC are written | 0x5D | 3001 (`8J0909144J`/`1K0909144J`), 3305, `1K0909144R` 3501 |
 
 The two slew patches are exclusive. HCA gains are capped at 160: at the largest
 HCA input, 160 gives 3.75 Nm against the rack's 3.8 Nm monitor, and tripping that

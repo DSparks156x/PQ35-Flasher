@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ from flasher.controllers.pq_eps import patches as P
 
 
 STOCK_GAINS = [[88, 113, 155]] * 3
+TRIP_3P8 = bytes.fromhex("33337340")
 
 
 def gen3_image(identity_at, identity, sites=()):
@@ -47,13 +49,14 @@ def gen3_image(identity_at, identity, sites=()):
 
 def tt3305():
     return gen3_image(0x5D824, b"8J0909144P \x003305", (
-        (0x5D0A4, b"\x01\x00"), (0x5D0A6, b"\x0a\x00"), (0x5D285, b"\x64"), (0x5D2F6, b"\x14")))
+        (0x5D0A4, b"\x01\x00"), (0x5D0A6, b"\x0a\x00"), (0x5D285, b"\x64"), (0x5D2F6, b"\x14"),
+        (P.TORQUE_TRIP, TRIP_3P8)))
 
 
 def tt3001():
     return gen3_image(0x5D7A0, b"8J0909144J \x003001", (
         (0x5D0A4, b"\x01\x00"), (0x5D0A6, b"\xcc\x00"), (0x5D249, b"\x64"), (0x5D2AE, b"\x14"),
-        (P.END_MARKER_OFFSET, b"Ende")))
+        (P.END_MARKER_OFFSET, b"Ende"), (P.TORQUE_TRIP, TRIP_3P8)))
 
 
 def crcs_valid(data):
@@ -156,6 +159,32 @@ class EpsPatchTests(unittest.TestCase):
         self.assertEqual(options["gains"], STOCK_GAINS)
         self.assertEqual(options["gain_max"], 160)
 
+    def test_torque_trip(self):
+        image = tt3305()
+        self.assertAlmostEqual(P.hca_torque_trip(image), 3.8, places=5)
+        word = set(range(P.TORQUE_TRIP, P.TORQUE_TRIP + 4))
+        crc = {0x5DFFE, 0x5DFFF}
+        for value in (4.0, 3.5, 12.25, 0.1, 20.0):
+            out = P.apply_patches(image, torque_trip=value)
+            # Only the existing float word and the 0x5D CRC are ever written.
+            self.assertLessEqual(changed(image, out), word | crc)
+            self.assertEqual(P.hca_torque_trip(out), struct.unpack("<f", struct.pack("<f", value))[0])
+            self.assertTrue(crcs_valid(out))
+        out = P.apply_patches(image, [P.HCA_TIMEOUT_MINSPEED], torque_trip=4.0)
+        self.assertEqual(out[P.TORQUE_TRIP:P.TORQUE_TRIP + 4], bytes.fromhex("00008040"))
+        self.assertEqual(changed(image, out), {0x5D09C, 0x5D09D, 0x5D09E, 0x5D285, 0x5D2F6} | crc)
+        self.assertTrue(crcs_valid(out))
+        self.assertEqual(P.apply_patches(image, torque_trip=3.8), image)
+        with self.assertRaisesRegex(ValueError, "0.1 to 20"):
+            P.apply_patches(image, torque_trip=38.0)
+
+    def test_torque_trip_needs_known_firmware(self):
+        self.assertIsNone(P.hca_torque_trip(tt3305()[P.DATASET_START:P.DATASET_END + 1]))
+        unknown = gen3_image(0x5D824, b"8J0909144P \x003999", ((P.TORQUE_TRIP, TRIP_3P8),))
+        self.assertIsNone(P.hca_torque_trip(unknown))
+        with self.assertRaises(P.UnsupportedFirmwarePatch):
+            P.apply_patches(unknown, torque_trip=4.0)
+
     def test_cli_combines_patches_and_gains(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "rack.bin"
@@ -163,11 +192,13 @@ class EpsPatchTests(unittest.TestCase):
             output = Path(folder) / "out.bin"
             with contextlib.redirect_stdout(io.StringIO()) as printed:
                 code = P.main([str(source), str(output), "--patch", P.HCA_TIMEOUT_MINSPEED,
-                               "--patch", P.SLEW_20, "--gains", "100,120,140"])
+                               "--patch", P.SLEW_20, "--gains", "100,120,140",
+                               "--torque-trip", "4"])
             self.assertEqual(code, 0)
             out = output.read_bytes()
             self.assertEqual(P.hca_gains(out), [[100, 120, 140]] * 3)
             self.assertEqual(out[0x5D0A4:0x5D0A8], b"\x14\x00\x14\x00")
+            self.assertEqual(P.hca_torque_trip(out), 4.0)
             self.assertIn("0x5D and 0x5E", printed.getvalue())
 
 

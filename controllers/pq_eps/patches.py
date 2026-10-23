@@ -14,6 +14,7 @@ image.
 """
 import argparse
 import hashlib
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -388,6 +389,13 @@ GAIN_FIRMWARE = (
     _identity(0x5D828, "1K0909144R", "3501"),
 )
 GAIN_PRESETS = {"hca-gain-140": 140, "hca-gain-160": 160}
+
+# HCA overlay torque trip: binary32 LE in the 0x5D block, stock 3.8 (33 33 73 40).
+# The safety monitor trips when abs((applied HCA + applied DSR) / 68) exceeds it,
+# and the same word bounds that transform at +-T. Same address and use in 3001,
+# 3305 and 3501. The range only catches typos; it is not a known-safe envelope.
+TORQUE_TRIP = 0x5D09C
+TORQUE_TRIP_RANGE = (0.1, 20.0)
 FEATURES = tuple(dict.fromkeys(manifest.feature for manifest in PATCH_MANIFESTS)) + tuple(GAIN_PRESETS)
 
 FEATURE_INFO = {
@@ -445,6 +453,32 @@ def set_hca_gains(image: bytes, gains, correct_checksums: bool = False) -> bytes
     return update_checksums(bytes(out))
 
 
+def hca_torque_trip(image: bytes) -> Optional[float]:
+    """The HCA overlay torque trip (Nm) of a full image of a documented firmware,
+    or None. A value outside TORQUE_TRIP_RANGE means the layout isn't the known one."""
+    if (len(image) != IMAGE_SIZE or image[0x5DFF8:0x5DFFC] != CRC_MARKER
+            or not any(site.state(image) == "match" for site in GAIN_FIRMWARE)):
+        return None
+    value = struct.unpack("<f", image[TORQUE_TRIP:TORQUE_TRIP + 4])[0]
+    low, high = TORQUE_TRIP_RANGE
+    return value if low <= value <= high else None
+
+
+def set_hca_torque_trip(image: bytes, value: float, correct_checksums: bool = False) -> bytes:
+    """Write the HCA overlay torque trip and rewrite the 0x5D CRC."""
+    if hca_torque_trip(image) is None:
+        raise UnsupportedFirmwarePatch(
+            f"No HCA torque trip at 0x{TORQUE_TRIP:05X} in the known layout for this image "
+            "(documented for 3001, 3305 and 3501); image was not modified")
+    low, high = TORQUE_TRIP_RANGE
+    if not isinstance(value, (int, float)) or not low <= value <= high:
+        raise ValueError(f"The HCA torque trip must be from {low} to {high} Nm")
+    check_checksums(image, correct=correct_checksums)
+    out = bytearray(image)
+    out[TORQUE_TRIP:TORQUE_TRIP + 4] = struct.pack("<f", value)
+    return update_checksums(bytes(out))
+
+
 def known_patches(image: bytes) -> dict:
     """Status of every manifest made for this image's firmware, and of the gain
     presets when the image has HCA gain tables."""
@@ -471,14 +505,18 @@ def patch_options(image: bytes) -> dict:
                          "manifest": name, "status": found.get(name) if name else None,
                          "group": next((sorted(g) for g in EXCLUSIVE if feature in g), None)})
     return {"features": features, "gains": hca_gains(image), "gain_speeds": list(GAIN_SPEEDS),
-            "gain_max": GAIN_MAX}
+            "gain_max": GAIN_MAX, "torque_trip": hca_torque_trip(image),
+            "torque_trip_range": list(TORQUE_TRIP_RANGE)}
 
 
-def apply_patches(image: bytes, features=(), gains=None, correct_checksums: bool = False) -> bytes:
-    """Apply several patches (and optionally explicit HCA gains) in one pass.
+def apply_patches(image: bytes, features=(), gains=None, correct_checksums: bool = False,
+                  torque_trip: Optional[float] = None) -> bytes:
+    """Apply several patches (and optionally explicit HCA gains and torque trip)
+    in one pass.
 
-    Manifest patches need a full image of their firmware; gains also work on a
-    4 KiB dataset. Every patch is checked before anything is written."""
+    Manifest patches and the torque trip need a full image of their firmware;
+    gains also work on a 4 KiB dataset. Every patch is checked before anything
+    is written."""
     features = list(dict.fromkeys(features))
     unknown = [f for f in features if f not in FEATURES]
     if unknown:
@@ -492,12 +530,16 @@ def apply_patches(image: bytes, features=(), gains=None, correct_checksums: bool
     if presets:
         gains = [[GAIN_PRESETS[presets[0]]] * len(GAIN_SPEEDS) for _ in GAIN_LUTS]
     manifests = [require_patch_manifest(image, f) for f in features if f not in GAIN_PRESETS]
+    if torque_trip is not None and hca_torque_trip(image) is None:
+        set_hca_torque_trip(image, torque_trip)  # raises with the reason
     check_checksums(image, correct=correct_checksums)
     out = update_checksums(image) if correct_checksums else image
     for manifest in manifests:
         out = manifest.apply(out)
     if gains is not None:
         out = set_hca_gains(out, gains)
+    if torque_trip is not None:
+        out = set_hca_torque_trip(out, torque_trip)
     return out
 
 
@@ -533,6 +575,9 @@ def report(image: bytes) -> bool:
         speeds = "/".join(str(s) for s in GAIN_SPEEDS)
         for index, row in enumerate(gains):
             print(f"HCA gain variant {index} at {speeds} km/h: {' '.join(str(g) for g in row)}")
+    trip = hca_torque_trip(image)
+    if trip is not None:
+        print(f"HCA torque trip at 0x{TORQUE_TRIP:05X}: {trip:.4g} Nm")
     return valid
 
 
@@ -555,23 +600,27 @@ def main(argv=None):
                         help=f"Set the HCA gains at {'/'.join(str(s) for s in GAIN_SPEEDS)} km/h "
                              f"(Q7, 128 = 1.0x, at most {GAIN_MAX}): one triple for every variant, "
                              "or one per variant 0..2 separated by /")
+    parser.add_argument("--torque-trip", type=float, metavar="NM",
+                        help=f"Set the HCA overlay torque trip at 0x{TORQUE_TRIP:05X} (stock 3.8 Nm; "
+                             f"{TORQUE_TRIP_RANGE[0]}..{TORQUE_TRIP_RANGE[1]})")
     parser.add_argument("--correct-checksum", action="store_true",
                         help="Accept an input whose dataset CRCs are wrong")
     args = parser.parse_args(argv)
     image = Path(args.input_bin).read_bytes()
-    if not args.patch and args.gains is None:
+    if not args.patch and args.gains is None and args.torque_trip is None:
         if args.output_bin or args.correct_checksum:
-            parser.error("an output file and --correct-checksum need --patch or --gains")
+            parser.error("an output file and --correct-checksum need --patch, --gains or --torque-trip")
         return 0 if report(image) else 1
     try:
-        patched = apply_patches(image, args.patch, args.gains, args.correct_checksum)
+        patched = apply_patches(image, args.patch, args.gains, args.correct_checksum, args.torque_trip)
     except ValueError as exc:
         parser.exit(1, f"Not patched: {exc}\n")
     source = Path(args.input_bin)
-    suffix = "_".join(args.patch + (["hca-gains"] if args.gains is not None else []))
-    output = Path(args.output_bin or source.with_name(f"{source.stem}_{suffix}{source.suffix}"))
+    names = (args.patch + (["hca-gains"] if args.gains is not None else [])
+             + ([f"trip-{args.torque_trip:g}"] if args.torque_trip is not None else []))
+    output = Path(args.output_bin or source.with_name(f"{source.stem}_{'_'.join(names)}{source.suffix}"))
     output.write_bytes(patched)
-    print(f"applied {', '.join(args.patch + (['HCA gains'] if args.gains is not None else []))}")
+    print(f"applied {', '.join(names)}")
     base = DATASET_START if len(image) == DATASET_SIZE else 0
     for change in _changes(image, patched, base):
         print(f"  0x{change['address']:05X}: {change['before']} -> {change['after']}")
