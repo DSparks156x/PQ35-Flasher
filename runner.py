@@ -173,6 +173,10 @@ def build_parser(family=None):
                         help="Read-only check (BCM only) of the four 10 85 programming preconditions "
                              "(supply voltage, attempt counter, two status flags); reports which gate "
                              "is blocking a flash instead of a bare NRC 0x22")
+    parser.add_argument("--read-dtcs", action="store_true",
+                        help="Read stored DTCs (KWP 18 02 FF 00 with fallbacks) and print JSON")
+    parser.add_argument("--clear-dtcs", action="store_true",
+                        help="Clear stored DTCs (KWP 14 FF 00) and print JSON")
     parser.add_argument("--motion-samples", type=int, default=1,
                         help="Number of stationary EPS motion samples (default 1, maximum 200)")
     parser.add_argument("--motion-interval-ms", type=int, default=100,
@@ -263,6 +267,10 @@ def _operation(args):
         return "recoveryflash"
     if getattr(args, "commit", False):
         return "commit"
+    if getattr(args, "read_dtcs", False):
+        return "dtc"
+    if getattr(args, "clear_dtcs", False):
+        return "dtc_clear"
     if args.readout:
         return "readout"
     return "flash"
@@ -346,8 +354,9 @@ def main(argv=None):
             args.read_eps_motion, args.read_eps_assist, args.read_eps_supply,
             args.read_eps_can_config, args.read_bcm_pageff, getattr(args, "bcm_backup", False),
             getattr(args, "bcm_preconditions", False), getattr(args, "probe_erase_budget", False),
-            getattr(args, "recovery_flash", False), getattr(args, "commit", False))) > 1:
-        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup, preconditions, probe, recovery-flash and commit operations cannot be combined")
+            getattr(args, "recovery_flash", False), getattr(args, "commit", False),
+            args.read_dtcs, args.clear_dtcs)) > 1:
+        parser.error("Identify, readout, EEPROM, fault, motion, assist, supply, CAN-config, page FF, backup, preconditions, probe, recovery-flash, commit and DTC operations cannot be combined")
     operation = _operation(args)
     if operation != "motion" and (args.motion_samples != 1 or args.motion_interval_ms != 100):
         parser.error("--motion-samples and --motion-interval-ms require --read-eps-motion")

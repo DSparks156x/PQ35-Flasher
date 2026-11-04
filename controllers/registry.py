@@ -24,6 +24,9 @@ class ControllerFamily:
 
     def matches_identification(self, info: dict) -> bool:
         part = str(info.get("software_part_number", info.get("part_number", ""))).strip().upper()
+        if not self.part_prefixes:
+            # Ungated families accept any module that identified at all.
+            return bool(part)
         return bool(part and any(part.startswith(prefix) for prefix in self.part_prefixes))
 
     def validate_identification(self, info: dict) -> None:
@@ -49,7 +52,7 @@ FAMILIES = (
         module_aliases=("awd", "haldex", "haldex-gen4", "allrad"),
         protocol_module="flasher.controllers.haldex_gen4.protocol",
         patches_module="flasher.controllers.haldex_gen4.patches",
-        operations=frozenset({"identify", "readout", "flash"}),
+        operations=frozenset({"identify", "readout", "flash", "log"}),
         part_prefixes=("0BR", "0AY", "0BS"),
     ),
     ControllerFamily(
@@ -60,6 +63,24 @@ FAMILIES = (
         patches_module="flasher.controllers.pq_eps.patches",
         operations=frozenset({"identify", "readout", "eeprom", "faults", "motion", "assist", "supply", "can_config", "flash", "probe", "recoveryflash", "commit"}),
         part_prefixes=("1K0909144", "8J0909144"),
+    ),
+    # Read-only diagnostic families: identification, measuring blocks and DTCs.
+    # No part-number gate; any engine or transmission ECU on that address.
+    ControllerFamily(
+        name="engine",
+        module=0x01,
+        module_aliases=("engine", "ecu", "motor"),
+        protocol_module="flasher.controllers.kwp_generic.protocol",
+        patches_module="",
+        operations=frozenset({"identify", "log", "dtc", "dtc_clear"}),
+    ),
+    ControllerFamily(
+        name="transmission",
+        module=0x02,
+        module_aliases=("transmission", "tcu", "gearbox"),
+        protocol_module="flasher.controllers.kwp_generic.protocol",
+        patches_module="",
+        operations=frozenset({"identify", "log", "dtc", "dtc_clear"}),
     ),
 )
 
